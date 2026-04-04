@@ -1,12 +1,13 @@
 # Local CI Engine MVP
 
-Single-machine local CI MVP for Node repositories.
+Single-machine local CI engine with repository-specific YAML workflows.
 
 ## Scope
 
-- Node.js runtime
-- Clone -> Install -> gitleaks -> Test -> semgrep -> Build
-- Stop immediately on failure
+- Bootstrap clone + dynamic workflow execution
+- Built-in steps: install, lightweight_security_scan, test, deep_security_scan, build
+- Custom command steps via YAML run
+- Per-step continue_on_failure policy
 - Persist logs and JSON artifacts under runs/
 
 ## Prerequisites
@@ -25,6 +26,83 @@ python main.py --repo https://github.com/example/repo.git --branch main
 Run with repository default branch:
 
 python main.py --repo https://github.com/example/repo.git
+
+Run with explicit workflow file:
+
+python main.py --repo https://github.com/example/repo.git --workflow .localci/workflow.yml
+
+If --workflow points to a missing relative YAML path, the engine creates a workflow file from the common template after clone and runs it.
+
+Relative workflow paths are resolved in this order:
+
+- cloned repository root
+- engine root
+
+Automatic workflow discovery inside cloned repository:
+
+- .localci/workflow.yml
+- .localci/workflow.yaml
+- .ci/workflow.yml
+- .ci/workflow.yaml
+
+If no workflow file is found, the engine falls back to the built-in default workflow.
+
+Current fallback behavior:
+
+- clone is always executed first
+- if no workflow file is found after clone, the engine generates .localci/workflow.yml from workflow.template.yml and executes it
+
+## Workflow YAML format
+
+Minimal example:
+
+name: project-ci
+runtime:
+	type: node
+steps:
+	- name: install
+		uses: install
+	- name: gitleaks
+		uses: lightweight_security_scan
+		continue_on_failure: true
+	- name: unit-test
+		uses: test
+	- name: semgrep
+		uses: deep_security_scan
+	- name: build
+		uses: build
+
+Command step example:
+
+steps:
+	- name: lint
+		run: ["npm", "run", "lint"]
+		cwd: .
+		env:
+			CI: "true"
+		continue_on_failure: true
+
+Built-in step ids:
+
+- install
+- lightweight_security_scan
+- test
+- deep_security_scan
+- build
+
+Workflow step fields:
+
+- name: visible step name in pipeline result
+- uses: built-in step id
+- run: custom command (string or list)
+- cwd: working directory relative to cloned repo (default: .)
+- env: extra environment variables
+- continue_on_failure: whether pipeline continues when this step fails
+- args: built-in step options
+	- lightweight_security_scan args.report_file
+	- deep_security_scan args.report_file
+
+Reference file: workflow.example.yml
 
 ## Output
 

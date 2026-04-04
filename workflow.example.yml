@@ -1,0 +1,31 @@
+name: juice-shop-default
+runtime:
+  type: node
+steps:
+  - name: install
+    uses: install
+
+  - name: lightweight-security
+    uses: lightweight_security_scan
+    continue_on_failure: true
+    args:
+      report_file: gitleaks_report.json
+
+  - name: test
+    uses: test
+
+  - name: deep-security
+    uses: deep_security_scan
+    args:
+      report_file: semgrep_report.json
+
+  - name: build
+    uses: build
+
+  # Custom command example
+  - name: lint
+    run:
+      - npm
+      - run
+      - lint
+    continue_on_failure: true

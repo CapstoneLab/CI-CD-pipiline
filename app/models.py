@@ -51,6 +51,7 @@ class StepRunResult:
 @dataclass
 class PipelineStep:
     step_name: str
+    continue_on_failure: bool = False
     status: str = "pending"
     started_at: str | None = None
     finished_at: str | None = None
@@ -69,6 +70,8 @@ class PipelineRun:
     branch: str | None
     runtime_type: str = "node"
     runtime_version: str | None = None
+    workflow_name: str | None = None
+    workflow_source: str | None = None
     status: str = "queued"
     current_step: str | None = None
     started_at: str | None = None
@@ -82,6 +85,8 @@ class PipelineRun:
             "branch": self.branch,
             "runtime_type": self.runtime_type,
             "runtime_version": self.runtime_version,
+            "workflow_name": self.workflow_name,
+            "workflow_source": self.workflow_source,
             "status": self.status,
             "current_step": self.current_step,
             "started_at": self.started_at,

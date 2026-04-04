@@ -5,3 +5,4 @@ typer==0.16.0
 dataclasses-json==0.6.7
 pytest==8.3.5
 python-dotenv==1.0.1
+PyYAML==6.0.2
