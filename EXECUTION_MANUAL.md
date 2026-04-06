@@ -145,6 +145,14 @@ Linux/macOS/Git Bash:
 
 ## 6. 표준 실행 절차
 
+SSH 트리거 + HTTP 콜백 운영 시 입력 파라미터:
+
+- --job-id: Windows가 생성한 작업 식별자
+- --repo: 실행 대상 GitHub 레포 URL
+- --branch: 대상 브랜치(기본 main)
+- --callback-url: Windows 콜백 API URL
+- --callback-token: x-callback-token 값
+
 ### 6.1 PowerShell
 
 cd <프로젝트_루트>
@@ -157,6 +165,10 @@ cd <프로젝트_루트>
 워크플로 파일 명시:
 
 .\.venv\Scripts\python.exe main.py --repo https://github.com/juice-shop/juice-shop --workflow .localci/workflow.yml
+
+콜백 포함 실행:
+
+.\.venv\Scripts\python.exe main.py --job-id <uuid> --repo https://github.com/juice-shop/juice-shop --branch main --callback-url https://windows-host/get-results --callback-token <shared-token>
 
 참고:
 
@@ -175,6 +187,10 @@ cd <프로젝트_루트>
 
 ./.venv/bin/python main.py --repo https://github.com/juice-shop/juice-shop --workflow .localci/workflow.yml
 
+콜백 포함 실행:
+
+./.venv/bin/python main.py --job-id <uuid> --repo https://github.com/juice-shop/juice-shop --branch main --callback-url https://windows-host/get-results --callback-token <shared-token>
+
 ## 7. 성공 판정 방법
 
 실행 후 출력에서 아래를 확인한다.
@@ -187,6 +203,8 @@ cd <프로젝트_루트>
 - runs/run-YYYYMMDD-XXX/pipeline_result.json
 - runs/run-YYYYMMDD-XXX/security_summary.json
 - runs/run-YYYYMMDD-XXX/security_findings.json
+- runs/run-YYYYMMDD-XXX/callback_result.json (callback_url 설정 시)
+- runs/run-YYYYMMDD-XXX/callback_delivery.json
 - runs/run-YYYYMMDD-XXX/logs/*.log
 
 ## 8. 실패 시 1차 진단

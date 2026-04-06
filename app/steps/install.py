@@ -21,15 +21,61 @@ def run_install(repo_dir: Path, log_file: Path) -> StepRunResult:
 
     lock_file = repo_dir / "package-lock.json"
     npm_cmd = npm_executable()
-    cmd = [npm_cmd, "ci", "--no-audit", "--no-fund"] if lock_file.exists() else [npm_cmd, "install", "--no-audit", "--no-fund"]
-    result = run_command(command=cmd, cwd=repo_dir, log_file=log_file)
+    if lock_file.exists():
+        ci_result = run_command(
+            command=[npm_cmd, "ci", "--no-audit", "--no-fund"],
+            cwd=repo_dir,
+            log_file=log_file,
+        )
+
+        if ci_result.exit_code == 0:
+            return StepRunResult(
+                status="success",
+                exit_code=0,
+                summary_message="dependencies installed (npm ci)",
+            )
+
+        # Some repositories commit stale lock files; fallback keeps CI compatible.
+        if _should_fallback_to_npm_install(ci_result.output):
+            install_result = run_command(
+                command=[npm_cmd, "install", "--no-audit", "--no-fund"],
+                cwd=repo_dir,
+                log_file=log_file,
+            )
+            if install_result.exit_code == 0:
+                return StepRunResult(
+                    status="success",
+                    exit_code=0,
+                    summary_message="dependencies installed (npm install fallback)",
+                )
+            return StepRunResult(
+                status="failed",
+                exit_code=install_result.exit_code,
+                summary_message="dependency install failed (npm ci fallback to npm install also failed)",
+            )
+
+        return StepRunResult(
+            status="failed",
+            exit_code=ci_result.exit_code,
+            summary_message="dependency install failed",
+        )
+
+    result = run_command(
+        command=[npm_cmd, "install", "--no-audit", "--no-fund"],
+        cwd=repo_dir,
+        log_file=log_file,
+    )
 
     if result.exit_code == 0:
-        install_mode = "npm ci" if lock_file.exists() else "npm install"
-        return StepRunResult(status="success", exit_code=0, summary_message=f"dependencies installed ({install_mode})")
+        return StepRunResult(status="success", exit_code=0, summary_message="dependencies installed (npm install)")
 
     return StepRunResult(
         status="failed",
         exit_code=result.exit_code,
         summary_message="dependency install failed",
     )
+
+
+def _should_fallback_to_npm_install(output: str) -> bool:
+    lowered = output.lower()
+    return "can only install packages when your package.json and package-lock.json" in lowered or "missing:" in lowered

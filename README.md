@@ -23,6 +23,10 @@ Run with explicit branch:
 
 python main.py --repo https://github.com/example/repo.git --branch main
 
+Run with Windows callback delivery:
+
+python main.py --job-id <uuid> --repo https://github.com/example/repo.git --branch main --callback-url https://windows-host/get-results --callback-token <shared-token>
+
 Run with repository default branch:
 
 python main.py --repo https://github.com/example/repo.git
@@ -111,6 +115,8 @@ Each run generates:
 - runs/run-YYYYMMDD-XXX/pipeline_result.json
 - runs/run-YYYYMMDD-XXX/security_summary.json
 - runs/run-YYYYMMDD-XXX/security_findings.json
+- runs/run-YYYYMMDD-XXX/callback_result.json (when callback_url is set)
+- runs/run-YYYYMMDD-XXX/callback_delivery.json (callback transmission status)
 - runs/run-YYYYMMDD-XXX/logs/*.log
 
 Cloned repository workspace:
