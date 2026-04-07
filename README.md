@@ -118,6 +118,17 @@ Each run generates:
 - runs/run-YYYYMMDD-XXX/callback_result.json (when callback_url is set)
 - runs/run-YYYYMMDD-XXX/callback_delivery.json (callback transmission status)
 - runs/run-YYYYMMDD-XXX/logs/*.log
+- runs/run-YYYYMMDD-XXX/artifacts/** (build outputs)
+
+Test step policy:
+
+- If no test files exist in repository, test step is skipped.
+- If test files exist but package.json test script is missing/placeholder, test step is skipped.
+
+Build step policy:
+
+- Build must generate deployable artifacts in known output paths.
+- If build command succeeds but no artifacts are found, build step is marked failed.
 
 Cloned repository workspace:
 

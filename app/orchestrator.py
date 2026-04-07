@@ -11,6 +11,7 @@ from app.steps.install import run_install
 from app.steps.lightweight_security import run_lightweight_security_scan
 from app.steps.test import run_test
 from app.utils.filesystem import make_run_id, prepare_run_paths, save_json
+from app.utils.logger import append_log
 from app.utils.shell import run_command
 from app.workflow import WorkflowStepDefinition, resolve_workflow_definition
 
@@ -124,6 +125,11 @@ class LocalOrchestrator:
             if result.status == "failed":
                 has_failure = True
                 if not step.continue_on_failure:
+                    self._mark_remaining_steps_skipped(
+                        pipeline_run=pipeline_run,
+                        remaining_steps=workflow_steps[workflow_steps.index(step) + 1 :],
+                        reason=f"Skipped because previous step failed: {step.step_name}",
+                    )
                     pipeline_run.status = "failed"
                     pipeline_run.finished_at = now_iso()
                     pipeline_run.current_step = step.step_name
@@ -186,7 +192,29 @@ class LocalOrchestrator:
         step.status = result.status
         step.exit_code = result.exit_code
         step.summary_message = result.summary_message
+
+        if step.log_file:
+            step_log_path = self.base_dir / step.log_file
+            append_log(step_log_path, f"[step_status] {step.status}")
+            append_log(step_log_path, f"[step_summary] {step.summary_message or 'no message'}")
+            append_log(step_log_path, f"[step_exit_code] {step.exit_code if step.exit_code is not None else 'null'}")
+
         self._write_pipeline_result(run_dir, pipeline_run)
+
+    @staticmethod
+    def _mark_remaining_steps_skipped(
+        pipeline_run: PipelineRun,
+        remaining_steps: list[PipelineStep],
+        reason: str,
+    ) -> None:
+        for step in remaining_steps:
+            if step.status != "pending":
+                continue
+            step.status = "skipped"
+            step.started_at = step.started_at or now_iso()
+            step.finished_at = now_iso()
+            step.exit_code = 0
+            step.summary_message = reason
 
     def _execute_step(
         self,
@@ -263,7 +291,11 @@ class LocalOrchestrator:
             )
 
         if uses_name == "build":
-            return run_build(repo_dir=repo_dir, log_file=log_file)
+            return run_build(
+                repo_dir=repo_dir,
+                log_file=log_file,
+                artifacts_dir=run_dir / "artifacts",
+            )
 
         return StepRunResult(
             status="failed",

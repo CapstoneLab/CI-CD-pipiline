@@ -37,8 +37,14 @@
 - build
   - build 우선
   - 없으면 build:frontend, build:server 순서로 fallback 실행
+  - 성공 시 산출물을 runs/<run_id>/artifacts/ 아래로 저장
+  - 명령은 성공했지만 산출물이 없으면 build step failed 처리
 
 즉, gitleaks에서 leaks가 발견되어도 최종 성공이 가능하다.
+
+- test
+  - 테스트 파일이 없으면 test step skipped
+  - 테스트 파일은 있으나 package.json test 스크립트가 없거나 placeholder면 skipped
 
 워크플로 커스터마이징 포인트:
 

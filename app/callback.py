@@ -26,6 +26,18 @@ def build_callback_payload(
         "started_at": pipeline_run.started_at,
         "ended_at": pipeline_run.finished_at,
         "logs": logs,
+        "steps": [
+            {
+                "name": step.step_name,
+                "status": step.status,
+                "exit_code": step.exit_code,
+                "summary": step.summary_message,
+                "started_at": step.started_at,
+                "finished_at": step.finished_at,
+                "log_file": step.log_file,
+            }
+            for step in pipeline_run.steps
+        ],
         "metadata": {
             "executor": "ubuntu-ci-engine",
             "run_id": pipeline_run.run_id,
@@ -35,14 +47,40 @@ def build_callback_payload(
     }
 
 
-def collect_logs(run_dir: Path, max_lines: int = 1000) -> list[str]:
+def collect_logs(
+    run_dir: Path,
+    pipeline_run: PipelineRun | None = None,
+    max_lines: int = 1000,
+) -> list[str]:
     logs_dir = run_dir / "logs"
     if not logs_dir.exists():
         return []
 
     collected: list[str] = []
 
+    ordered_log_files: list[Path] = []
+    seen_names: set[str] = set()
+
+    if pipeline_run:
+        for step in pipeline_run.steps:
+            if not step.log_file:
+                continue
+
+            file_name = Path(step.log_file).name
+            candidate = logs_dir / file_name
+            if not candidate.exists() or file_name in seen_names:
+                continue
+
+            ordered_log_files.append(candidate)
+            seen_names.add(file_name)
+
     for log_file in sorted(logs_dir.glob("*.log")):
+        if log_file.name in seen_names:
+            continue
+        ordered_log_files.append(log_file)
+        seen_names.add(log_file.name)
+
+    for log_file in ordered_log_files:
         try:
             lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:

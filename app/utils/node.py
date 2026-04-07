@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -40,13 +41,36 @@ def is_placeholder_test_script(script_value: str | None) -> bool:
 
 
 def has_test_files(repo_dir: Path) -> bool:
-    if (repo_dir / "test").is_dir() or (repo_dir / "tests").is_dir():
-        return True
+    test_file_patterns = [
+        "*.spec.js",
+        "*.test.js",
+        "*.spec.ts",
+        "*.test.ts",
+        "*.spec.jsx",
+        "*.test.jsx",
+        "*.spec.tsx",
+        "*.test.tsx",
+        "*.spec.mjs",
+        "*.test.mjs",
+        "*.spec.cjs",
+        "*.test.cjs",
+    ]
+    ignored_dirs = {
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "coverage",
+        ".next",
+        "out",
+    }
 
-    patterns = ["*.spec.js", "*.test.js", "*.spec.ts", "*.test.ts"]
-    for pattern in patterns:
-        if any(repo_dir.rglob(pattern)):
-            return True
+    for root, dirs, files in os.walk(repo_dir):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs]
+
+        for file_name in files:
+            if any(fnmatch.fnmatch(file_name, pattern) for pattern in test_file_patterns):
+                return True
 
     return False
 

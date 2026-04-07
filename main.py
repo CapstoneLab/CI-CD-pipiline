@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -48,7 +49,7 @@ def main() -> int:
     callback_token = args.callback_token.strip()
     if callback_url:
         job_id = args.job_id.strip() or pipeline_run.run_id
-        logs = collect_logs(run_dir)
+        logs = collect_logs(run_dir, pipeline_run=pipeline_run)
         payload = build_callback_payload(
             job_id=job_id,
             repo_url=args.repo,
@@ -94,12 +95,42 @@ def main() -> int:
             print(f"local callback payload: {callback_result_path}")
 
     print("\n=== Pipeline Result ===")
-    print(f"run_id: {pipeline_run.run_id}")
-    print(f"status: {pipeline_run.status}")
-    print(f"result file: {run_dir / 'pipeline_result.json'}")
+    result_file = run_dir / "pipeline_result.json"
+    output_run_id = pipeline_run.run_id
+    output_status = pipeline_run.status
+    output_steps: list[dict[str, str]] = []
 
-    for step in pipeline_run.steps:
-        print(f"- {step.step_name}: {step.status} ({step.summary_message or 'no message'})")
+    try:
+        payload = json.loads(result_file.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            output_run_id = str(payload.get("run_id") or output_run_id)
+            output_status = str(payload.get("status") or output_status)
+
+        steps = payload.get("steps", [])
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                output_steps.append(
+                    {
+                        "step_name": str(step.get("step_name") or "unknown"),
+                        "status": str(step.get("status") or "unknown"),
+                        "summary": str(step.get("summary_message") or "no message"),
+                    }
+                )
+    except Exception:
+        output_steps = []
+
+    print(f"run_id: {output_run_id}")
+    print(f"status: {output_status}")
+    print(f"result file: {result_file}")
+
+    if output_steps:
+        for step in output_steps:
+            print(f"- {step['step_name']}: {step['status']} ({step['summary']})")
+    else:
+        for step in pipeline_run.steps:
+            print(f"- {step.step_name}: {step.status} ({step.summary_message or 'no message'})")
 
     return 0 if pipeline_run.status == "success" else 1
 
