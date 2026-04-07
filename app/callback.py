@@ -50,7 +50,7 @@ def build_callback_payload(
 def collect_logs(
     run_dir: Path,
     pipeline_run: PipelineRun | None = None,
-    max_lines: int = 1000,
+    max_lines: int | None = None,
 ) -> list[str]:
     logs_dir = run_dir / "logs"
     if not logs_dir.exists():
@@ -89,6 +89,9 @@ def collect_logs(
         file_name = log_file.name
         for line in lines:
             collected.append(f"[{file_name}] {line}")
+
+    if max_lines is None:
+        return collected
 
     if len(collected) <= max_lines:
         return collected

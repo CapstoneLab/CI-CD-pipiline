@@ -4,7 +4,19 @@ from pathlib import Path
 
 from app.models import StepRunResult
 from app.utils.logger import append_log
-from app.utils.node import get_script, has_script, has_test_files, is_placeholder_test_script, npm_executable
+from app.utils.node import (
+    corepack_executable,
+    detect_package_manager,
+    get_script,
+    has_script,
+    has_test_files,
+    is_command_available,
+    is_placeholder_test_script,
+    package_manager_executable,
+    package_manager_prepare_target,
+    test_command,
+    wrap_with_corepack,
+)
 from app.utils.shell import run_command
 
 
@@ -27,10 +39,36 @@ def run_test(repo_dir: Path, log_file: Path) -> StepRunResult:
             summary_message="Test files detected but package.json test script is missing, skipped",
         )
 
-    cmd = [npm_executable(), "test"]
+    package_manager = detect_package_manager(repo_dir)
+    cmd = test_command(package_manager)
+    cmd = _resolve_runner_command(cmd=cmd, package_manager=package_manager, repo_dir=repo_dir, log_file=log_file)
+    if not cmd:
+        return StepRunResult(
+            status="failed",
+            exit_code=127,
+            summary_message=f"{package_manager} executable not available",
+        )
+
     result = run_command(command=cmd, cwd=repo_dir, log_file=log_file, env={"CI": "true"})
 
     if result.exit_code == 0:
-        return StepRunResult(status="success", exit_code=0, summary_message="npm test passed")
+        return StepRunResult(status="success", exit_code=0, summary_message=f"{package_manager} test passed")
 
-    return StepRunResult(status="failed", exit_code=result.exit_code, summary_message="npm test failed")
+    return StepRunResult(status="failed", exit_code=result.exit_code, summary_message=f"{package_manager} test failed")
+
+
+def _resolve_runner_command(cmd: list[str], package_manager: str, repo_dir: Path, log_file: Path) -> list[str] | None:
+    executable = package_manager_executable(package_manager)
+    if is_command_available(executable):
+        return cmd
+
+    if package_manager not in {"yarn", "pnpm"}:
+        return None
+
+    corepack = corepack_executable()
+    if not is_command_available(corepack):
+        return None
+
+    prepare_cmd = [corepack, "prepare", package_manager_prepare_target(repo_dir, package_manager), "--activate"]
+    run_command(command=prepare_cmd, cwd=repo_dir, log_file=log_file)
+    return wrap_with_corepack(cmd, package_manager)

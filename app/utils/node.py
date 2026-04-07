@@ -3,7 +3,11 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import shutil
 from pathlib import Path
+
+
+SUPPORTED_PACKAGE_MANAGERS = {"npm", "yarn", "pnpm"}
 
 
 def read_package_json(repo_dir: Path) -> dict:
@@ -77,3 +81,103 @@ def has_test_files(repo_dir: Path) -> bool:
 
 def npm_executable() -> str:
     return "npm.cmd" if os.name == "nt" else "npm"
+
+
+def package_manager_executable(package_manager: str) -> str:
+    if package_manager == "npm":
+        return "npm.cmd" if os.name == "nt" else "npm"
+    if package_manager == "yarn":
+        return "yarn.cmd" if os.name == "nt" else "yarn"
+    if package_manager == "pnpm":
+        return "pnpm.cmd" if os.name == "nt" else "pnpm"
+    return package_manager
+
+
+def corepack_executable() -> str:
+    return "corepack.cmd" if os.name == "nt" else "corepack"
+
+
+def is_command_available(command_name: str) -> bool:
+    return shutil.which(command_name) is not None
+
+
+def detect_package_manager(repo_dir: Path) -> str:
+    package_data = read_package_json(repo_dir)
+
+    package_manager_field = package_data.get("packageManager")
+    if isinstance(package_manager_field, str):
+        manager_name = package_manager_field.split("@", 1)[0].strip().lower()
+        if manager_name in SUPPORTED_PACKAGE_MANAGERS:
+            return manager_name
+
+    if (repo_dir / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (repo_dir / "yarn.lock").exists():
+        return "yarn"
+    if (repo_dir / "package-lock.json").exists() or (repo_dir / "npm-shrinkwrap.json").exists():
+        return "npm"
+
+    return "npm"
+
+
+def package_manager_prepare_target(repo_dir: Path, package_manager: str) -> str:
+    package_data = read_package_json(repo_dir)
+    package_manager_field = package_data.get("packageManager")
+    if isinstance(package_manager_field, str):
+        raw_value = package_manager_field.strip()
+        lowered = raw_value.lower()
+        if lowered.startswith(f"{package_manager}@") and "@" in raw_value:
+            return raw_value
+    return f"{package_manager}@stable"
+
+
+def wrap_with_corepack(command: list[str], package_manager: str) -> list[str]:
+    if not command:
+        return command
+    return [corepack_executable(), package_manager, *command[1:]]
+
+
+def has_lock_file(repo_dir: Path, package_manager: str) -> bool:
+    if package_manager == "npm":
+        return (repo_dir / "package-lock.json").exists() or (repo_dir / "npm-shrinkwrap.json").exists()
+    if package_manager == "yarn":
+        return (repo_dir / "yarn.lock").exists()
+    if package_manager == "pnpm":
+        return (repo_dir / "pnpm-lock.yaml").exists()
+    return False
+
+
+def install_command(package_manager: str, frozen_lock: bool) -> list[str]:
+    exe = package_manager_executable(package_manager)
+    if package_manager == "npm":
+        if frozen_lock:
+            return [exe, "ci", "--no-audit", "--no-fund"]
+        return [exe, "install", "--no-audit", "--no-fund"]
+
+    if package_manager == "yarn":
+        if frozen_lock:
+            return [exe, "install", "--frozen-lockfile"]
+        return [exe, "install"]
+
+    if package_manager == "pnpm":
+        if frozen_lock:
+            return [exe, "install", "--frozen-lockfile"]
+        return [exe, "install", "--no-frozen-lockfile"]
+
+    return [exe, "install"]
+
+
+def run_script_command(package_manager: str, script_name: str) -> list[str]:
+    exe = package_manager_executable(package_manager)
+    if package_manager == "yarn":
+        return [exe, "run", script_name]
+    return [exe, "run", script_name]
+
+
+def test_command(package_manager: str) -> list[str]:
+    exe = package_manager_executable(package_manager)
+    if package_manager == "yarn":
+        return [exe, "test"]
+    if package_manager == "pnpm":
+        return [exe, "test"]
+    return [exe, "test"]
