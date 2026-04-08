@@ -50,6 +50,8 @@ def run_lightweight_security_scan(repo_dir: Path, log_file: Path, report_file: P
     summary, findings = parse_gitleaks_report(report_file)
     found_count = len(findings)
 
+    _log_gitleaks_findings(log_file, findings)
+
     if found_count > 0:
         return StepRunResult(
             status="success",
@@ -68,3 +70,15 @@ def run_lightweight_security_scan(repo_dir: Path, log_file: Path, report_file: P
         security_summary=summary,
         security_findings=findings,
     )
+
+
+def _log_gitleaks_findings(log_file: Path, findings: list) -> None:
+    from app.utils.logger import append_log
+
+    if not findings:
+        append_log(log_file, "[gitleaks] No secrets detected.")
+        return
+
+    append_log(log_file, f"[gitleaks] {len(findings)} secret(s) found:")
+    for i, f in enumerate(findings, 1):
+        append_log(log_file, f"  [{i}] rule={f.rule_id} | {f.file_path}:{f.line_number} | {f.title}")

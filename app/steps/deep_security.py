@@ -58,6 +58,8 @@ def run_deep_security_scan(repo_dir: Path, log_file: Path, report_file: Path) ->
 
     summary, findings = parse_semgrep_report(report_file)
 
+    _log_semgrep_findings(log_file, findings, summary)
+
     max_cvss = summary.max_cvss_score
     if max_cvss is not None and max_cvss >= CRITICAL_CVSS_THRESHOLD:
         return StepRunResult(
@@ -83,3 +85,29 @@ def run_deep_security_scan(repo_dir: Path, log_file: Path, report_file: Path) ->
         security_summary=summary,
         security_findings=findings,
     )
+
+
+def _log_semgrep_findings(log_file: Path, findings: list, summary) -> None:
+    from app.utils.logger import append_log
+
+    total = len(findings)
+    append_log(
+        log_file,
+        f"[semgrep] {total} finding(s): "
+        f"critical={summary.critical_count}, high={summary.high_count}, "
+        f"medium={summary.medium_count}, low={summary.low_count}",
+    )
+
+    if not findings:
+        return
+
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.severity, 4))
+
+    for i, f in enumerate(sorted_findings, 1):
+        cvss_str = f" | cvss={f.cvss_score:.1f}" if f.cvss_score is not None else ""
+        append_log(
+            log_file,
+            f"  [{i}] [{f.severity.upper()}]{cvss_str} {f.rule_id} | "
+            f"{f.file_path}:{f.line_number} | {f.message}",
+        )
