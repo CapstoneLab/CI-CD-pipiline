@@ -5,6 +5,7 @@ DEFAULT_FALLBACK_STEP_NAMES = [
     "test",
     "deep_security_scan",
     "build",
+    "deploy",
 ]
 
 BUILTIN_STEP_NAMES = set(DEFAULT_FALLBACK_STEP_NAMES)

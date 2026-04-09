@@ -21,3 +21,6 @@ steps:
 
   - name: build
     uses: build
+
+  - name: deploy
+    uses: deploy

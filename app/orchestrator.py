@@ -7,6 +7,7 @@ from app.models import PipelineRun, PipelineStep, SecurityFinding, SecuritySumma
 from app.steps.build import run_build
 from app.steps.clone import run_clone
 from app.steps.deep_security import run_deep_security_scan
+from app.steps.deploy import run_deploy
 from app.steps.install import run_install
 from app.steps.lightweight_security import run_lightweight_security_scan
 from app.steps.test import run_test
@@ -244,6 +245,8 @@ class LocalOrchestrator:
                 repo_dir=repo_dir,
                 run_dir=run_dir,
                 log_file=log_file,
+                repo_url=repo_url,
+                branch=branch,
             )
 
         if step_definition.kind == "command":
@@ -265,6 +268,8 @@ class LocalOrchestrator:
         repo_dir: Path,
         run_dir: Path,
         log_file: Path,
+        repo_url: str = "",
+        branch: str | None = None,
     ) -> StepRunResult:
         uses_name = step_definition.uses
 
@@ -295,6 +300,15 @@ class LocalOrchestrator:
                 repo_dir=repo_dir,
                 log_file=log_file,
                 artifacts_dir=run_dir / "artifacts",
+            )
+
+        if uses_name == "deploy":
+            return run_deploy(
+                repo_dir=repo_dir,
+                run_dir=run_dir,
+                log_file=log_file,
+                repo_url=repo_url,
+                branch=branch,
             )
 
         return StepRunResult(
