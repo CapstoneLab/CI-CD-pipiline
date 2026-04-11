@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import ast
 import fnmatch
 import os
-import shutil
-from pathlib import Path
-
 import re
+import shutil
+from dataclasses import dataclass, field as dataclasses_field
+from pathlib import Path
 
 try:
     import tomllib
@@ -412,3 +413,413 @@ def has_pytest_configured(repo_dir: Path) -> bool:
     if isinstance(tool, dict) and "pytest" in tool:
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# ASGI entry point auto-detection
+# ---------------------------------------------------------------------------
+
+_ASGI_CLASS_NAMES = {"FastAPI", "Starlette", "Sanic", "Quart", "Litestar"}
+_ENTRY_IGNORED_DIR_NAMES = _IGNORED_DIRS | {
+    "tests",
+    "test",
+    "__pycache__",
+    "migrations",
+    "alembic",
+    "scripts",
+    "docs",
+    "examples",
+}
+
+
+@dataclass
+class AsgiEntryPoint:
+    """Describe how to launch an ASGI application with uvicorn.
+
+    Attributes:
+        module: Dotted Python module path (e.g. ``secure_app.api``).
+        attr:   The attribute on that module. Either a module-level
+                variable holding an app instance or a factory function
+                that returns one.
+        is_factory: ``True`` when ``attr`` is a callable (factory) that
+                must be invoked to produce the app. Signalled to
+                uvicorn via ``--factory``.
+        required_kwargs: Names of keyword-only (or positional-without-default)
+                parameters the factory requires. Empty when ``is_factory``
+                is False or the factory takes no required arguments. The
+                build step uses this to decide whether a wrapper module
+                needs to be generated.
+        app_dir: Directory relative to the project root that should be
+                passed to ``uvicorn --app-dir``. ``"."`` for repos where
+                the package lives at the project root, ``"src"`` for
+                ``src``-layout projects.
+        file_path: Relative path of the source file the entry point was
+                detected in, for logging only.
+    """
+
+    module: str
+    attr: str
+    is_factory: bool
+    app_dir: str
+    file_path: str
+    required_kwargs: list[str] = dataclasses_field(default_factory=list)
+
+
+def _detect_src_layout(project_root: Path) -> str:
+    """Return ``"src"`` for projects whose Python packages live under
+    ``src/`` (PEP 518 src-layout), otherwise ``"."``.
+
+    Checks ``pyproject.toml`` first (setuptools / hatchling / poetry
+    variants), then falls back to a filesystem heuristic: if
+    ``src/<something>/__init__.py`` exists, assume src-layout.
+    """
+    data = read_pyproject(project_root)
+    if isinstance(data, dict):
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else None
+        if isinstance(tool, dict):
+            setuptools_cfg = tool.get("setuptools") if isinstance(tool.get("setuptools"), dict) else None
+            if isinstance(setuptools_cfg, dict):
+                pkg_dir = setuptools_cfg.get("package-dir")
+                if isinstance(pkg_dir, dict) and pkg_dir.get("") == "src":
+                    return "src"
+                find_cfg = setuptools_cfg.get("packages")
+                if isinstance(find_cfg, dict):
+                    nested = find_cfg.get("find")
+                    if isinstance(nested, dict) and nested.get("where") == ["src"]:
+                        return "src"
+
+    src_dir = project_root / "src"
+    if src_dir.is_dir():
+        try:
+            for child in src_dir.iterdir():
+                if child.is_dir() and (child / "__init__.py").exists():
+                    return "src"
+        except OSError:
+            pass
+    return "."
+
+
+def _iter_python_source_files(root: Path):
+    """Yield ``.py`` files under ``root`` that are plausible application
+    source files (excluding tests, venvs, build outputs, etc)."""
+    if not root.is_dir():
+        return
+    for path in root.rglob("*.py"):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        # Skip hidden / ignored directories anywhere in the relative path
+        parents = rel.parts[:-1]
+        if any(part in _ENTRY_IGNORED_DIR_NAMES or part.startswith(".") for part in parents):
+            continue
+        yield path
+
+
+def _file_to_module_path(py_file: Path, search_root: Path) -> str:
+    try:
+        rel = py_file.relative_to(search_root)
+    except ValueError:
+        return ""
+    parts = list(rel.parts)
+    if not parts:
+        return ""
+    last = parts[-1]
+    if last == "__init__.py":
+        parts.pop()
+    elif last.endswith(".py"):
+        parts[-1] = last[:-3]
+    else:
+        return ""
+    if not parts or not all(p.isidentifier() for p in parts):
+        return ""
+    return ".".join(parts)
+
+
+def _call_name(call: ast.Call) -> str:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def _function_returns_asgi(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Heuristic: if the function body contains any ``FastAPI()``-style
+    call (directly or in an assignment), treat it as an app factory."""
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call) and _call_name(node) in _ASGI_CLASS_NAMES:
+            return True
+    return False
+
+
+def _parse_source(py_file: Path) -> tuple[str, ast.Module] | None:
+    try:
+        source = py_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    if not any(name in source for name in _ASGI_CLASS_NAMES):
+        return None
+    try:
+        tree = ast.parse(source, filename=str(py_file))
+    except (SyntaxError, ValueError):
+        return None
+    return source, tree
+
+
+def _scan_module_level_app(
+    py_file: Path, search_root: Path, app_dir: str, project_root: Path
+) -> AsgiEntryPoint | None:
+    parsed = _parse_source(py_file)
+    if parsed is None:
+        return None
+    _, tree = parsed
+    module_path = _file_to_module_path(py_file, search_root)
+    if not module_path:
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            if _call_name(node.value) in _ASGI_CLASS_NAMES:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        return AsgiEntryPoint(
+                            module=module_path,
+                            attr=target.id,
+                            is_factory=False,
+                            app_dir=app_dir,
+                            file_path=str(py_file.relative_to(project_root)),
+                        )
+    return None
+
+
+def _required_factory_args(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    """Return the names of parameters that *must* be supplied when
+    calling this function.
+
+    Includes:
+        - positional parameters without defaults
+        - keyword-only parameters without defaults
+
+    Excludes:
+        - ``self`` / ``cls``
+        - ``*args`` / ``**kwargs``
+    """
+    required: list[str] = []
+    args_obj = func.args
+
+    positional = list(args_obj.posonlyargs) + list(args_obj.args)
+    defaults = list(args_obj.defaults)
+    # `defaults` align with the TAIL of `positional`
+    num_without_default = len(positional) - len(defaults)
+    for idx, arg in enumerate(positional):
+        if arg.arg in {"self", "cls"}:
+            continue
+        if idx < num_without_default:
+            required.append(arg.arg)
+
+    for arg, default in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
+        if default is None:
+            required.append(arg.arg)
+
+    return required
+
+
+def _scan_factory(
+    py_file: Path, search_root: Path, app_dir: str, project_root: Path
+) -> AsgiEntryPoint | None:
+    parsed = _parse_source(py_file)
+    if parsed is None:
+        return None
+    _, tree = parsed
+    module_path = _file_to_module_path(py_file, search_root)
+    if not module_path:
+        return None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _function_returns_asgi(node):
+                return AsgiEntryPoint(
+                    module=module_path,
+                    attr=node.name,
+                    is_factory=True,
+                    app_dir=app_dir,
+                    file_path=str(py_file.relative_to(project_root)),
+                    required_kwargs=_required_factory_args(node),
+                )
+    return None
+
+
+def find_asgi_entry_point(project_root: Path) -> AsgiEntryPoint | None:
+    """Locate an ASGI application entry point by parsing Python sources.
+
+    Detection strategy (in order of preference):
+        1. Top-level assignment ``app = FastAPI(...)`` (or Starlette,
+           Sanic, Quart, Litestar) at module scope.
+        2. Factory function whose body instantiates one of those
+           classes. Returned with ``is_factory=True`` so callers know
+           to pass ``--factory`` to uvicorn.
+
+    Supports src-layout (``package-dir = { "" = "src" }`` or
+    ``src/<pkg>/__init__.py``). Skips tests, virtualenvs, build
+    outputs, migrations and other non-application directories.
+
+    Returns ``None`` when no ASGI app is found — the caller can then
+    decide whether to treat the repo as a non-service project or fall
+    back to a heuristic candidate list.
+    """
+    app_dir = _detect_src_layout(project_root)
+    search_root = project_root / app_dir if app_dir != "." else project_root
+
+    # Pass 1: prefer an explicit module-level app instance
+    for py_file in _iter_python_source_files(search_root):
+        match = _scan_module_level_app(py_file, search_root, app_dir, project_root)
+        if match is not None:
+            return match
+
+    # Pass 2: fall back to factory functions
+    for py_file in _iter_python_source_files(search_root):
+        match = _scan_factory(py_file, search_root, app_dir, project_root)
+        if match is not None:
+            return match
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Wrapper module generation for factories that require arguments
+# ---------------------------------------------------------------------------
+
+# Parameter-name heuristics for auto-injecting default values into factory
+# calls. Path-like arguments get a runtime state directory, config-like
+# arguments get ``None``. Any other required argument cannot be guessed
+# safely, so wrapper generation is refused in that case.
+_PATH_ARG_HINTS = frozenset(
+    {
+        "data_dir",
+        "base_dir",
+        "root_dir",
+        "working_dir",
+        "workdir",
+        "datadir",
+        "db_dir",
+        "storage_dir",
+        "state_dir",
+        "cache_dir",
+        "upload_dir",
+        "media_dir",
+        "static_dir",
+        "log_dir",
+        "logs_dir",
+    }
+)
+_OPTIONAL_CONFIG_HINTS = frozenset(
+    {"config", "settings", "options", "cfg", "config_path", "config_file"}
+)
+
+
+@dataclass
+class FactoryWrapperPlan:
+    """Plan for synthesising a wrapper module around an ASGI factory.
+
+    The wrapper calls ``<original.module>.<original.attr>(**injected_kwargs)``
+    and exposes the result as a module-level ``app`` variable, which uvicorn
+    can then load without the ``--factory`` flag.
+    """
+
+    original: AsgiEntryPoint
+    injected_kwargs: dict[str, str]  # kwarg name -> python source expression
+    needs_state_dir: bool
+
+
+def plan_entry_wrapper(entry: AsgiEntryPoint) -> FactoryWrapperPlan | None:
+    """Decide whether a factory can be wrapped automatically.
+
+    Returns a :class:`FactoryWrapperPlan` when every required factory
+    argument can be matched to a safe default (via name-based hints),
+    otherwise ``None``.
+    """
+    if not entry.is_factory or not entry.required_kwargs:
+        return None
+
+    injected: dict[str, str] = {}
+    needs_state_dir = False
+    for arg_name in entry.required_kwargs:
+        lowered = arg_name.lower()
+        if lowered in _PATH_ARG_HINTS:
+            injected[arg_name] = "_LOCALCI_STATE_DIR"
+            needs_state_dir = True
+            continue
+        if lowered in _OPTIONAL_CONFIG_HINTS:
+            injected[arg_name] = "None"
+            continue
+        # Unknown argument — do not guess.
+        return None
+
+    return FactoryWrapperPlan(
+        original=entry,
+        injected_kwargs=injected,
+        needs_state_dir=needs_state_dir,
+    )
+
+
+def render_wrapper_module(plan: FactoryWrapperPlan) -> str:
+    """Render the Python source for an auto-generated wrapper module."""
+    header = (
+        '"""Auto-generated ASGI entry wrapper.\n\n'
+        "Generated by the CI engine because the original factory\n"
+        f"`{plan.original.module}.{plan.original.attr}` requires arguments\n"
+        "that uvicorn's --factory flag cannot supply directly. Defaults are\n"
+        "injected based on parameter-name heuristics.\n\n"
+        'Do not edit; this file is regenerated on every build."""\n'
+    )
+    imports = ["from __future__ import annotations", ""]
+    if plan.needs_state_dir:
+        imports += ["from pathlib import Path", ""]
+    imports.append(f"from {plan.original.module} import {plan.original.attr}")
+
+    state_block: list[str] = []
+    if plan.needs_state_dir:
+        state_block = [
+            "",
+            "_LOCALCI_STATE_DIR = Path(__file__).resolve().parent / \".localci-runtime\"",
+            "_LOCALCI_STATE_DIR.mkdir(parents=True, exist_ok=True)",
+        ]
+
+    kwarg_lines = ",\n    ".join(
+        f"{name}={expression}" for name, expression in plan.injected_kwargs.items()
+    )
+    call_block = [
+        "",
+        f"app = {plan.original.attr}(",
+        f"    {kwarg_lines},",
+        ")",
+        "",
+    ]
+
+    return "\n".join([header, *imports, *state_block, *call_block])
+
+
+WRAPPER_MODULE_BASENAME = "_localci_entry"
+
+
+def write_entry_wrapper(project_root: Path, plan: FactoryWrapperPlan) -> AsgiEntryPoint:
+    """Write the wrapper module into the right spot of the project and
+    return a new :class:`AsgiEntryPoint` pointing at it.
+
+    The wrapper is placed next to the original source file under the
+    same ``app_dir`` so its import path stays at the module root.
+    """
+    app_dir = plan.original.app_dir
+    target_dir = project_root / app_dir if app_dir != "." else project_root
+    target_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_path = target_dir / f"{WRAPPER_MODULE_BASENAME}.py"
+    wrapper_path.write_text(render_wrapper_module(plan), encoding="utf-8")
+
+    return AsgiEntryPoint(
+        module=WRAPPER_MODULE_BASENAME,
+        attr="app",
+        is_factory=False,
+        app_dir=app_dir,
+        file_path=str(wrapper_path.relative_to(project_root)),
+        required_kwargs=[],
+    )
