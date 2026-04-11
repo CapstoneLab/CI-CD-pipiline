@@ -20,6 +20,7 @@ from app.workflow import WorkflowStepDefinition, resolve_workflow_definition
 class LocalOrchestrator:
     def __init__(self, base_dir: Path) -> None:
         self.base_dir = base_dir
+        self._current_runtime_type: str = RUNTIME_TYPE
 
     def run(self, repo_url: str, branch: str | None, workflow_path: str | None = None) -> tuple[PipelineRun, Path]:
         run_id = make_run_id(self.base_dir)
@@ -95,6 +96,7 @@ class LocalOrchestrator:
         pipeline_run.runtime_type = workflow.runtime_type
         pipeline_run.workflow_name = workflow.name
         pipeline_run.workflow_source = workflow.source
+        self._current_runtime_type = workflow.runtime_type
 
         workflow_steps = [
             PipelineStep(
@@ -247,6 +249,7 @@ class LocalOrchestrator:
                 log_file=log_file,
                 repo_url=repo_url,
                 branch=branch,
+                runtime_type=self._current_runtime_type,
             )
 
         if step_definition.kind == "command":
@@ -270,11 +273,12 @@ class LocalOrchestrator:
         log_file: Path,
         repo_url: str = "",
         branch: str | None = None,
+        runtime_type: str = RUNTIME_TYPE,
     ) -> StepRunResult:
         uses_name = step_definition.uses
 
         if uses_name == "install":
-            return run_install(repo_dir=repo_dir, log_file=log_file)
+            return run_install(repo_dir=repo_dir, log_file=log_file, runtime_type=runtime_type)
 
         if uses_name == "lightweight_security_scan":
             report_name = _safe_report_file_name(step_definition.args.get("report_file"), "gitleaks_report.json")
@@ -285,7 +289,7 @@ class LocalOrchestrator:
             )
 
         if uses_name == "test":
-            return run_test(repo_dir=repo_dir, log_file=log_file)
+            return run_test(repo_dir=repo_dir, log_file=log_file, runtime_type=runtime_type)
 
         if uses_name == "deep_security_scan":
             report_name = _safe_report_file_name(step_definition.args.get("report_file"), "semgrep_report.json")
@@ -300,6 +304,7 @@ class LocalOrchestrator:
                 repo_dir=repo_dir,
                 log_file=log_file,
                 artifacts_dir=run_dir / "artifacts",
+                runtime_type=runtime_type,
             )
 
         if uses_name == "deploy":
@@ -309,6 +314,7 @@ class LocalOrchestrator:
                 log_file=log_file,
                 repo_url=repo_url,
                 branch=branch,
+                runtime_type=runtime_type,
             )
 
         return StepRunResult(
