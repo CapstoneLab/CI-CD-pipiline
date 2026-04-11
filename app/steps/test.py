@@ -17,6 +17,17 @@ from app.utils.node import (
     test_command,
     wrap_with_corepack,
 )
+from app.utils.java import (
+    build_tool_executable as java_build_tool_executable,
+    detect_build_tool as java_detect_build_tool,
+    ensure_wrapper_executable as java_ensure_wrapper_executable,
+    find_java_project_root,
+    has_test_files as java_has_test_files,
+    has_wrapper as java_has_wrapper,
+    is_command_available as java_is_command_available,
+    is_java_project,
+    test_command as java_test_command,
+)
 from app.utils.python import (
     detect_package_manager as py_detect_package_manager,
     effective_package_manager as py_effective_package_manager,
@@ -39,6 +50,8 @@ from app.utils.shell import run_command
 def run_test(repo_dir: Path, log_file: Path, runtime_type: str = "node") -> StepRunResult:
     if runtime_type == "python":
         return _run_python_test(repo_dir=repo_dir, log_file=log_file)
+    if runtime_type == "java":
+        return _run_java_test(repo_dir=repo_dir, log_file=log_file)
     return _run_node_test(repo_dir=repo_dir, log_file=log_file)
 
 
@@ -188,3 +201,54 @@ def _ensure_python_runner_available(package_manager: str, repo_dir: Path, log_fi
     if install_result.exit_code != 0:
         return "pytest unavailable and venv pip install failed"
     return None
+
+
+def _run_java_test(repo_dir: Path, log_file: Path) -> StepRunResult:
+    if not is_java_project(repo_dir):
+        append_log(log_file, "No java project markers; test step skipped")
+        append_log(log_file, "[exit_code] 0")
+        return StepRunResult(status="skipped", exit_code=0, summary_message="No java project")
+
+    project_root = find_java_project_root(repo_dir)
+    if not java_has_test_files(project_root):
+        append_log(
+            log_file,
+            "No test sources found under src/test/{java,kotlin,groovy}; skipped",
+        )
+        append_log(log_file, "[exit_code] 0")
+        return StepRunResult(
+            status="skipped",
+            exit_code=0,
+            summary_message="No java test sources found",
+        )
+
+    build_tool = java_detect_build_tool(project_root)
+    java_ensure_wrapper_executable(project_root, build_tool)
+
+    using_wrapper = java_has_wrapper(project_root, build_tool)
+    executable = java_build_tool_executable(project_root, build_tool)
+    if not using_wrapper and not java_is_command_available(executable):
+        return StepRunResult(
+            status="failed",
+            exit_code=127,
+            summary_message=(
+                f"Command not found: {build_tool} "
+                f"(install it on the engine host or include the {build_tool} wrapper)"
+            ),
+        )
+
+    cmd = java_test_command(project_root, build_tool)
+    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
+
+    if result.exit_code == 0:
+        return StepRunResult(
+            status="success",
+            exit_code=0,
+            summary_message=f"java tests passed ({build_tool})",
+        )
+
+    return StepRunResult(
+        status="failed",
+        exit_code=result.exit_code,
+        summary_message=f"java tests failed ({build_tool})",
+    )

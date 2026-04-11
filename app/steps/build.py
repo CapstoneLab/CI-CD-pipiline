@@ -16,6 +16,18 @@ from app.utils.node import (
     run_script_command,
     wrap_with_corepack,
 )
+from app.utils.java import (
+    artifact_directories as java_artifact_directories,
+    build_command as java_build_command,
+    build_tool_executable as java_build_tool_executable,
+    detect_build_tool as java_detect_build_tool,
+    ensure_wrapper_executable as java_ensure_wrapper_executable,
+    find_java_project_root,
+    has_wrapper as java_has_wrapper,
+    is_command_available as java_is_command_available,
+    is_deployable_artifact as java_is_deployable_artifact,
+    is_java_project,
+)
 from app.utils.python import (
     build_command as py_build_command,
     detect_package_manager as py_detect_package_manager,
@@ -39,6 +51,8 @@ def run_build(
 ) -> StepRunResult:
     if runtime_type == "python":
         return _run_python_build(repo_dir=repo_dir, log_file=log_file, artifacts_dir=artifacts_dir)
+    if runtime_type == "java":
+        return _run_java_build(repo_dir=repo_dir, log_file=log_file, artifacts_dir=artifacts_dir)
     return _run_node_build(repo_dir=repo_dir, log_file=log_file, artifacts_dir=artifacts_dir)
 
 
@@ -396,3 +410,93 @@ def _create_python_fallback_directory(repo_dir: Path, output_dir: Path) -> None:
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, destination)
+
+
+def _run_java_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> StepRunResult:
+    if not is_java_project(repo_dir):
+        return StepRunResult(
+            status="failed",
+            exit_code=1,
+            summary_message="No Java project markers found (pom.xml / build.gradle)",
+        )
+
+    project_root = find_java_project_root(repo_dir)
+    build_tool = java_detect_build_tool(project_root)
+    java_ensure_wrapper_executable(project_root, build_tool)
+
+    using_wrapper = java_has_wrapper(project_root, build_tool)
+    executable = java_build_tool_executable(project_root, build_tool)
+    if not using_wrapper and not java_is_command_available(executable):
+        return StepRunResult(
+            status="failed",
+            exit_code=127,
+            summary_message=(
+                f"Command not found: {build_tool} "
+                f"(install it on the engine host or include the {build_tool} wrapper)"
+            ),
+        )
+
+    cmd = java_build_command(project_root, build_tool)
+    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
+    if result.exit_code != 0:
+        return StepRunResult(
+            status="failed",
+            exit_code=result.exit_code,
+            summary_message=f"java build failed ({build_tool})",
+        )
+
+    collected = _collect_java_build_artifacts(
+        project_root=project_root,
+        artifacts_dir=artifacts_dir,
+        build_tool=build_tool,
+    )
+    if not collected:
+        append_log(
+            log_file,
+            f"Java build ({build_tool}) succeeded but no JAR/WAR artifacts were found "
+            f"in {', '.join(java_artifact_directories(build_tool))}",
+        )
+        return StepRunResult(
+            status="failed",
+            exit_code=1,
+            summary_message=f"java build produced no deployable JAR/WAR ({build_tool})",
+        )
+
+    meta_path = artifacts_dir / "build_meta.json"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "repo": str(project_root),
+        "runtime": "java",
+        "build_tool": build_tool,
+        "artifacts": collected,
+    }
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return StepRunResult(
+        status="success",
+        exit_code=0,
+        summary_message=(
+            f"java build succeeded ({build_tool}) | artifacts: {', '.join(collected)}"
+        ),
+    )
+
+
+def _collect_java_build_artifacts(
+    project_root: Path,
+    artifacts_dir: Path,
+    build_tool: str,
+) -> list[str]:
+    collected: list[str] = []
+    for relative in java_artifact_directories(build_tool):
+        source_dir = project_root / relative
+        if not source_dir.exists() or not source_dir.is_dir():
+            continue
+        for pattern in ("*.jar", "*.war", "*.ear"):
+            for artifact in sorted(source_dir.glob(pattern)):
+                if not java_is_deployable_artifact(artifact):
+                    continue
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                destination = artifacts_dir / artifact.name
+                shutil.copy2(artifact, destination)
+                collected.append(artifact.name)
+    return collected

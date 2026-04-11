@@ -17,6 +17,16 @@ from app.utils.node import (
     strip_engine_managed_dependencies,
     wrap_with_corepack,
 )
+from app.utils.java import (
+    build_tool_executable as java_build_tool_executable,
+    detect_build_tool as java_detect_build_tool,
+    ensure_wrapper_executable as java_ensure_wrapper_executable,
+    find_java_project_root,
+    has_wrapper as java_has_wrapper,
+    install_command as java_install_command,
+    is_command_available as java_is_command_available,
+    is_java_project,
+)
 from app.utils.python import (
     create_venv_command,
     detect_package_manager as py_detect_package_manager,
@@ -50,6 +60,8 @@ def _detect_node_project(repo_dir: Path) -> tuple[bool, str]:
 def run_install(repo_dir: Path, log_file: Path, runtime_type: str = "node") -> StepRunResult:
     if runtime_type == "python":
         return _run_python_install(repo_dir=repo_dir, log_file=log_file)
+    if runtime_type == "java":
+        return _run_java_install(repo_dir=repo_dir, log_file=log_file)
     return _run_node_install(repo_dir=repo_dir, log_file=log_file)
 
 
@@ -288,3 +300,45 @@ def _ensure_python_venv(repo_dir: Path, log_file: Path) -> str | None:
         log_file=log_file,
     )
     return None
+
+
+def _run_java_install(repo_dir: Path, log_file: Path) -> StepRunResult:
+    if not is_java_project(repo_dir):
+        return StepRunResult(
+            status="failed",
+            exit_code=1,
+            summary_message="No Java project markers found (pom.xml / build.gradle)",
+        )
+
+    project_root = find_java_project_root(repo_dir)
+    build_tool = java_detect_build_tool(project_root)
+    java_ensure_wrapper_executable(project_root, build_tool)
+
+    using_wrapper = java_has_wrapper(project_root, build_tool)
+    executable = java_build_tool_executable(project_root, build_tool)
+
+    if not using_wrapper and not java_is_command_available(executable):
+        return StepRunResult(
+            status="failed",
+            exit_code=127,
+            summary_message=(
+                f"Command not found: {build_tool} "
+                f"(install it on the engine host or include the {build_tool} wrapper in the repo)"
+            ),
+        )
+
+    cmd = java_install_command(project_root, build_tool)
+    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
+    if result.exit_code == 0:
+        wrapper_note = " via wrapper" if using_wrapper else ""
+        return StepRunResult(
+            status="success",
+            exit_code=0,
+            summary_message=f"java dependencies resolved ({build_tool}{wrapper_note})",
+        )
+
+    return StepRunResult(
+        status="failed",
+        exit_code=result.exit_code,
+        summary_message=f"java dependency resolution failed ({build_tool})",
+    )

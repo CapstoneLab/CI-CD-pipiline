@@ -18,4 +18,4 @@ RUNS_DIR_NAME = "runs"
 WORKSPACE_DIR_NAME = "workspace"
 
 RUNTIME_TYPE = "node"
-SUPPORTED_RUNTIMES = {"node", "python"}
+SUPPORTED_RUNTIMES = {"node", "python", "java"}
