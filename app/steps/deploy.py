@@ -60,6 +60,16 @@ def run_deploy(
 
     append_log(log_file, f"Artifacts directory: {artifacts_dir}")
 
+    # Load any Python-side metadata (ASGI entry point) that the build
+    # step recorded for the deploy step to consume.
+    python_entry = _load_python_entry_from_build_meta(artifacts_dir)
+    if python_entry:
+        append_log(
+            log_file,
+            f"Python entry from build_meta: {python_entry['module']}:{python_entry['attr']}"
+            f" (factory={python_entry.get('factory', False)}, app_dir={python_entry.get('app_dir', '.')})",
+        )
+
     # ------------------------------------------------------------------
     # 3. Detect runtime type from repo contents
     # ------------------------------------------------------------------
@@ -155,6 +165,7 @@ def run_deploy(
         s3_bucket=S3_BUCKET,
         s3_prefix=s3_prefix,
         artifact_hash=artifact_hash,
+        python_entry=python_entry,
     )
     append_log(log_file, "Sending deploy command to EC2 via SSM...")
 
@@ -251,6 +262,38 @@ def run_deploy(
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+
+def _load_python_entry_from_build_meta(artifacts_dir: Path) -> dict | None:
+    """Read the ASGI entry point that the build step recorded.
+
+    Returns a dict like ``{"module": "secure_app.api", "attr": "create_app",
+    "factory": True, "app_dir": "src", "file_path": "src/secure_app/api.py"}``
+    or ``None`` if the file is missing, malformed, or has no entry field.
+    """
+    meta_path = artifacts_dir / "build_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    entry = data.get("entry")
+    if not isinstance(entry, dict):
+        return None
+    module = entry.get("module")
+    attr = entry.get("attr")
+    if not isinstance(module, str) or not module or not isinstance(attr, str) or not attr:
+        return None
+    return {
+        "module": module,
+        "attr": attr,
+        "factory": bool(entry.get("factory")),
+        "app_dir": str(entry.get("app_dir") or "."),
+        "file_path": str(entry.get("file_path") or ""),
+    }
 
 
 def _parse_github_url(url: str) -> tuple[str, str]:
@@ -394,12 +437,25 @@ def _build_ec2_deploy_script(
     s3_bucket: str,
     s3_prefix: str,
     artifact_hash: str,
+    python_entry: dict | None = None,
 ) -> str:
     """Build the shell script that runs on EC2 to deploy the app."""
     app_dir = f"{EC2_DEPLOY_ROOT}/apps/{owner}/{repo_name}"
     hash_file = f"{app_dir}/.deploy_hash"
     port_file = f"{EC2_DEPLOY_ROOT}/.port_registry"
     nginx_conf = f"{EC2_NGINX_CONF_DIR}/{owner}__{repo_name}.conf"
+
+    # Python entry point (resolved at build time by the engine's AST
+    # scanner). Empty strings mean "unknown" — the deploy script will
+    # fall back to its legacy candidate list.
+    if python_entry:
+        predetected_entry = f"{python_entry.get('module', '')}:{python_entry.get('attr', '')}"
+        predetected_app_dir = str(python_entry.get("app_dir") or ".")
+        predetected_factory = "yes" if python_entry.get("factory") else ""
+    else:
+        predetected_entry = ""
+        predetected_app_dir = ""
+        predetected_factory = ""
 
     return f"""#!/bin/bash
 set -ex
@@ -413,6 +469,11 @@ S3_PATH="s3://{s3_bucket}/{s3_prefix}/"
 RUNTIME="{runtime}"
 OWNER="{owner}"
 REPO="{repo_name}"
+
+# --- Python entry point injected by the engine (from build_meta.json) ---
+PREDETECTED_PY_ENTRY="{predetected_entry}"
+PREDETECTED_PY_APP_DIR="{predetected_app_dir}"
+PREDETECTED_PY_FACTORY="{predetected_factory}"
 
 # --- Ensure deploy directories exist ---
 mkdir -p {EC2_DEPLOY_ROOT}/apps
@@ -664,17 +725,35 @@ elif [ "$RUNTIME" = "python" ]; then
     done
 
     # Resolve application entry point as module:attr.
-    # Check typical FastAPI/Flask layouts in order.
+    # Preference order:
+    #   1. Pre-detected entry from build_meta.json (AST-based, handles
+    #      src-layout and factory patterns correctly).
+    #   2. Legacy heuristic: probe a fixed list of common file locations.
     ENTRY=""
-    CANDIDATES="app/main.py:app.main:app src/main.py:src.main:app main.py:main:app app.py:app:app wsgi.py:wsgi:application application.py:application:application asgi.py:asgi:application"
-    for cand in $CANDIDATES; do
-        rel_file=$(echo "$cand" | cut -d: -f1)
-        mod_attr=$(echo "$cand" | cut -d: -f2-)
-        if [ -f "$APP_ROOT/$rel_file" ]; then
-            ENTRY="$mod_attr"
-            break
+    APP_DIR_FOR_UVICORN="$APP_ROOT"
+    UVICORN_FACTORY_FLAG=""
+
+    if [ -n "$PREDETECTED_PY_ENTRY" ]; then
+        ENTRY="$PREDETECTED_PY_ENTRY"
+        if [ -n "$PREDETECTED_PY_APP_DIR" ] && [ "$PREDETECTED_PY_APP_DIR" != "." ]; then
+            APP_DIR_FOR_UVICORN="$APP_ROOT/$PREDETECTED_PY_APP_DIR"
         fi
-    done
+        if [ "$PREDETECTED_PY_FACTORY" = "yes" ]; then
+            UVICORN_FACTORY_FLAG="--factory"
+        fi
+        echo "Using pre-detected python entry: $ENTRY (app-dir=$APP_DIR_FOR_UVICORN factory=$PREDETECTED_PY_FACTORY)"
+    else
+        CANDIDATES="app/main.py:app.main:app src/main.py:src.main:app main.py:main:app app.py:app:app wsgi.py:wsgi:application application.py:application:application asgi.py:asgi:application"
+        for cand in $CANDIDATES; do
+            rel_file=$(echo "$cand" | cut -d: -f1)
+            mod_attr=$(echo "$cand" | cut -d: -f2-)
+            if [ -f "$APP_ROOT/$rel_file" ]; then
+                ENTRY="$mod_attr"
+                break
+            fi
+        done
+    fi
+
     if [ -z "$ENTRY" ]; then
         echo "ERROR: no python entry point found (looked for app/main.py, main.py, app.py, wsgi.py, asgi.py)"
         exit 1
@@ -704,12 +783,13 @@ elif [ "$RUNTIME" = "python" ]; then
     if [ "$ASGI_FRAMEWORK" = "yes" ]; then
         nohup "$VENV_PY" -m uvicorn "$ENTRY" \\
             --host 0.0.0.0 --port "$PORT" \\
-            --app-dir "$APP_ROOT" \\
+            --app-dir "$APP_DIR_FOR_UVICORN" \\
+            $UVICORN_FACTORY_FLAG \\
             > "$STDOUT_LOG" 2> "$STDERR_LOG" < /dev/null &
     else
         nohup "$VENV_PY" -m gunicorn "$ENTRY" \\
             -b "0.0.0.0:$PORT" \\
-            --chdir "$APP_ROOT" \\
+            --chdir "$APP_DIR_FOR_UVICORN" \\
             > "$STDOUT_LOG" 2> "$STDERR_LOG" < /dev/null &
     fi
     APP_PID=$!
@@ -854,11 +934,37 @@ while IFS=' ' read -r APP_PATH APP_PORT; do
         *)        BADGE_CLASS="badge-static";  BADGE_TEXT="Static" ;;
     esac
 
-    # Check if process is actually running
+    # Decide whether the app is "up".
+    # Static SPA runtimes (React / Vue / Angular / Next.js static export)
+    # are served directly by Nginx from files on disk, so there is no
+    # backend process listening on a port. For those, we mark the app as
+    # up when the deployed directory and its Nginx config both exist.
+    # Proxy-based runtimes (Node / Python / Java / Next.js SSR) must have
+    # a process listening on $APP_PORT.
+    APP_NGINX_CONF="{EC2_NGINX_CONF_DIR}/${{APP_OWNER}}__${{APP_REPO}}.conf"
     STATUS_DOT="\\xF0\\x9F\\x9F\\xA2"  # green circle
-    if ! ss -tlnp 2>/dev/null | grep -q ":$APP_PORT "; then
-        STATUS_DOT="\\xF0\\x9F\\x94\\xB4"  # red circle
-    fi
+    case "$MANIFEST_RUNTIME" in
+        react|vue|angular)
+            if [ ! -d "$APP_DIR_CHECK" ] || [ ! -f "$APP_NGINX_CONF" ]; then
+                STATUS_DOT="\\xF0\\x9F\\x94\\xB4"  # red circle
+            fi
+            ;;
+        nextjs)
+            # Next.js can be either static export or SSR. Trust the port
+            # probe if anything is listening, otherwise treat file
+            # presence as "up" so static exports are not marked down.
+            if ! ss -tlnp 2>/dev/null | grep -q ":$APP_PORT "; then
+                if [ ! -d "$APP_DIR_CHECK" ] || [ ! -f "$APP_NGINX_CONF" ]; then
+                    STATUS_DOT="\\xF0\\x9F\\x94\\xB4"
+                fi
+            fi
+            ;;
+        *)
+            if ! ss -tlnp 2>/dev/null | grep -q ":$APP_PORT "; then
+                STATUS_DOT="\\xF0\\x9F\\x94\\xB4"
+            fi
+            ;;
+    esac
 
     TABLE_ROWS="$TABLE_ROWS<tr><td>$(echo -e $STATUS_DOT) <a href=\\\"/$APP_PATH/\\\">$APP_OWNER/$APP_REPO</a></td><td><span class=\\\"badge $BADGE_CLASS\\\">$BADGE_TEXT</span></td><td class=\\\"port\\\">:$APP_PORT</td><td><a href=\\\"/$APP_PATH/\\\">/$APP_PATH/</a></td></tr>"
 done < "$PORT_FILE"

@@ -17,16 +17,20 @@ from app.utils.node import (
     wrap_with_corepack,
 )
 from app.utils.python import (
+    AsgiEntryPoint,
     build_command as py_build_command,
     detect_package_manager as py_detect_package_manager,
     effective_package_manager as py_effective_package_manager,
     effective_python_executable,
+    find_asgi_entry_point,
     find_python_project_root,
     is_command_available as py_is_command_available,
     is_python_project,
     package_manager_executable as py_package_manager_executable,
+    plan_entry_wrapper,
     python_executable,
     venv_exists,
+    write_entry_wrapper,
 )
 from app.utils.shell import run_command
 
@@ -194,9 +198,6 @@ def _create_node_fallback_directory(repo_dir: Path, output_dir: Path) -> None:
         shutil.copy2(path, destination)
 
 
-_PYTHON_BUILDABLE_MANAGERS = {"poetry", "uv", "pdm", "hatch"}
-
-
 def _run_python_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> StepRunResult:
     if not is_python_project(repo_dir):
         return StepRunResult(
@@ -207,138 +208,87 @@ def _run_python_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> St
 
     project_root = find_python_project_root(repo_dir)
     package_manager = py_effective_package_manager(project_root)
-    buildable = package_manager in _PYTHON_BUILDABLE_MANAGERS or (project_root / "pyproject.toml").exists()
 
-    if not buildable:
+    # Detect ASGI entry point up-front by AST-scanning the source tree.
+    # The result is baked into build_meta.json so the deploy step does
+    # not have to redo this work on EC2 (where AST scanning would be
+    # awkward) and so src-layout / factory patterns are handled correctly.
+    entry = find_asgi_entry_point(project_root)
+    if entry is not None:
         append_log(
             log_file,
-            "No pyproject.toml or buildable package manager detected; generating source fallback artifacts",
-        )
-        generated = _create_python_fallback_artifacts(
-            repo_dir=project_root,
-            artifacts_dir=artifacts_dir,
-            package_manager=package_manager,
-        )
-        return StepRunResult(
-            status="success",
-            exit_code=0,
-            summary_message=(
-                f"python build skipped ({package_manager} non-buildable) | artifacts saved: {', '.join(generated)}"
+            (
+                f"Detected ASGI entry point: {entry.module}:{entry.attr} "
+                f"(factory={entry.is_factory}, app_dir={entry.app_dir}, "
+                f"file={entry.file_path}, required_kwargs={entry.required_kwargs})"
             ),
         )
+        # uvicorn's --factory flag cannot supply arguments. If the factory
+        # requires any, synthesise a wrapper module that invokes it with
+        # heuristically-derived defaults and redirect the entry point to
+        # that wrapper (which exposes a plain module-level `app`).
+        if entry.is_factory and entry.required_kwargs:
+            plan = plan_entry_wrapper(entry)
+            if plan is not None:
+                wrapped_entry = write_entry_wrapper(project_root=project_root, plan=plan)
+                append_log(
+                    log_file,
+                    (
+                        f"Generated entry wrapper {wrapped_entry.file_path} "
+                        f"injecting kwargs {sorted(plan.injected_kwargs.keys())}; "
+                        f"entry rewritten to {wrapped_entry.module}:{wrapped_entry.attr}"
+                    ),
+                )
+                entry = wrapped_entry
+            else:
+                append_log(
+                    log_file,
+                    (
+                        f"Cannot auto-wrap factory {entry.module}:{entry.attr}: "
+                        f"required args {entry.required_kwargs} have no safe default. "
+                        "Deploy will likely fail; the repo needs an arg-free factory or a "
+                        "module-level `app = ...` assignment."
+                    ),
+                )
+    else:
+        append_log(
+            log_file,
+            "No ASGI entry point detected; deploy will fall back to heuristic candidates.",
+        )
 
-    build_tool_missing = _ensure_python_build_tool_available(
-        package_manager=package_manager,
-        repo_dir=project_root,
-        log_file=log_file,
+    # Python apps are deployed by running the source tree directly via
+    # uvicorn/gunicorn, not by installing a wheel. Building a wheel with
+    # `python -m build` produces only *.whl / *.tar.gz under `dist/`, which
+    # breaks the deploy step's entry-point search. Always package the source
+    # tree as the deployable artifact so deploy has everything it needs.
+    append_log(
+        log_file,
+        f"Packaging python source tree as deployable artifact ({package_manager}); "
+        "wheel/sdist build is skipped because deploy runs from source.",
     )
-    if build_tool_missing:
-        return StepRunResult(status="failed", exit_code=127, summary_message=build_tool_missing)
+    generated = _create_python_fallback_artifacts(
+        repo_dir=project_root,
+        artifacts_dir=artifacts_dir,
+        package_manager=package_manager,
+        entry=entry,
+    )
 
-    cmd = py_build_command(package_manager, repo_dir=project_root)
-    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
-    if result.exit_code != 0:
-        # Many FastAPI/Flask-style apps have a pyproject.toml for dependency
-        # management only and do not declare a distributable package layout
-        # (e.g. missing `packages = [...]` with poetry-core). In that case
-        # `python -m build` / `poetry build` fails even though the repo is
-        # perfectly deployable as a source tree. Emit a source fallback
-        # artifact and continue instead of aborting the pipeline.
-        append_log(
-            log_file,
-            f"python build ({package_manager}) failed to produce a wheel/sdist; "
-            "packaging source tree as fallback artifact",
-        )
-        generated = _create_python_fallback_artifacts(
-            repo_dir=project_root,
-            artifacts_dir=artifacts_dir,
-            package_manager=package_manager,
-        )
-        return StepRunResult(
-            status="success",
-            exit_code=0,
-            summary_message=(
-                f"python build fell back to source artifact "
-                f"({package_manager} build failed) | artifacts saved: {', '.join(generated)}"
-            ),
-        )
-
-    collected = _collect_python_build_artifacts(repo_dir=project_root, artifacts_dir=artifacts_dir)
-    if not collected:
-        collected = _create_python_fallback_artifacts(
-            repo_dir=project_root,
-            artifacts_dir=artifacts_dir,
-            package_manager=package_manager,
-        )
-        append_log(
-            log_file,
-            "Python build completed without standard dist output; generated source fallback artifacts",
-        )
-
+    summary_entry = f" | entry: {entry.module}:{entry.attr}" if entry else ""
     return StepRunResult(
         status="success",
         exit_code=0,
         summary_message=(
-            f"python build succeeded ({package_manager}) | artifacts saved: {', '.join(collected)}"
+            f"python source packaged ({package_manager}) | artifacts saved: "
+            f"{', '.join(generated)}{summary_entry}"
         ),
     )
-
-
-def _ensure_python_build_tool_available(package_manager: str, repo_dir: Path, log_file: Path) -> str | None:
-    if package_manager in _PYTHON_BUILDABLE_MANAGERS:
-        executable = py_package_manager_executable(package_manager)
-        if py_is_command_available(executable):
-            return None
-        return f"Command not found: {package_manager} (required for python build)"
-
-    # Fallback path uses `python -m build`; ensure the `build` module can be invoked.
-    if not venv_exists(repo_dir):
-        return (
-            "python virtualenv (.venv) not found; "
-            "ensure the install step ran before build"
-        )
-    py = effective_python_executable(repo_dir)
-    probe = run_command(
-        command=[py, "-m", "build", "--version"],
-        cwd=repo_dir,
-        log_file=log_file,
-    )
-    if probe.exit_code != 0:
-        install_result = run_command(
-            command=[py, "-m", "pip", "install", "build"],
-            cwd=repo_dir,
-            log_file=log_file,
-        )
-        if install_result.exit_code != 0:
-            return "python 'build' package unavailable and venv pip install failed"
-    return None
-
-
-def _collect_python_build_artifacts(repo_dir: Path, artifacts_dir: Path) -> list[str]:
-    candidates = ["dist", "build"]
-    collected: list[str] = []
-
-    for relative in candidates:
-        source = repo_dir / relative
-        if not source.exists() or not source.is_dir():
-            continue
-        if not any(source.iterdir()):
-            continue
-
-        destination = artifacts_dir / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(source, destination)
-        collected.append(relative)
-
-    return collected
 
 
 def _create_python_fallback_artifacts(
     repo_dir: Path,
     artifacts_dir: Path,
     package_manager: str,
+    entry: AsgiEntryPoint | None = None,
 ) -> list[str]:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     fallback_dir_name = "dist-python"
@@ -346,13 +296,21 @@ def _create_python_fallback_artifacts(
     _create_python_fallback_directory(repo_dir=repo_dir, output_dir=fallback_dir_path)
 
     meta_path = artifacts_dir / "build_meta.json"
-    payload = {
+    payload: dict = {
         "repo": str(repo_dir),
         "runtime": "python",
         "package_manager": package_manager,
         "note": "No python wheel/sdist produced; packaged source tree as deployable fallback.",
         "fallback_directory": fallback_dir_name,
     }
+    if entry is not None:
+        payload["entry"] = {
+            "module": entry.module,
+            "attr": entry.attr,
+            "factory": entry.is_factory,
+            "app_dir": entry.app_dir,
+            "file_path": entry.file_path,
+        }
     meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return [fallback_dir_name, meta_path.name]
 
