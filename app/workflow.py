@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from app.constants import BUILTIN_STEP_NAMES, RUNTIME_TYPE
+from app.utils.java import is_java_project
 from app.utils.python import is_python_project
 
 
@@ -97,6 +98,8 @@ def detect_repo_runtime(repo_dir: Path) -> str:
         return "node"
     if is_python_project(repo_dir):
         return "python"
+    if is_java_project(repo_dir):
+        return "java"
     return RUNTIME_TYPE
 
 
@@ -105,6 +108,8 @@ def _runtime_markers_present(runtime_type: str, repo_dir: Path) -> bool:
         return (repo_dir / "package.json").exists()
     if runtime_type == "python":
         return is_python_project(repo_dir)
+    if runtime_type == "java":
+        return is_java_project(repo_dir)
     return False
 
 

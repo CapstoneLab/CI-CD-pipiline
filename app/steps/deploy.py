@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.models import StepRunResult
 from app.utils.logger import append_log
+from app.utils.java import is_java_project
 from app.utils.python import find_python_project_root, is_python_project
 from app.utils.shell import run_command
 
@@ -69,6 +70,8 @@ def run_deploy(
     # that does not match the repo contents (monorepo edge cases).
     if runtime_type == "python" or (runtime_type is None and is_python_project(repo_dir)):
         runtime = "python"
+    elif runtime_type == "java" or (runtime_type is None and is_java_project(repo_dir)):
+        runtime = "java"
     elif runtime_type and runtime_type not in {"node"}:
         runtime = runtime_type
     else:
@@ -311,10 +314,12 @@ def _detect_runtime(repo_dir: Path) -> str:
         return "python"
     if (repo_dir / "pom.xml").exists() or (repo_dir / "build.gradle").exists():
         return "java"
-    # Monorepo fallback: shallow scan for python project markers in
-    # subdirectories (e.g. backend/pyproject.toml).
+    # Monorepo fallback: shallow scan for python/java project markers in
+    # subdirectories (e.g. backend/pyproject.toml, services/api/pom.xml).
     if is_python_project(repo_dir):
         return "python"
+    if is_java_project(repo_dir):
+        return "java"
     return "node"
 
 
@@ -508,6 +513,11 @@ elif [ "$RUNTIME" = "python" ]; then
     for d in dist-python dist dist-server build out; do
         [ -d "$APP_DIR/$d" ] && APP_ROOT="$APP_DIR/$d" && break
     done
+elif [ "$RUNTIME" = "java" ]; then
+    # For Java we keep APP_ROOT at $APP_DIR because the JAR/WAR files are
+    # copied into the artifacts root by the engine build step, so they
+    # live directly under the deployed app directory.
+    APP_ROOT="$APP_DIR"
 else
     for d in dist dist-server build out; do
         [ -d "$APP_DIR/$d" ] && APP_ROOT="$APP_DIR/$d" && break
@@ -734,13 +744,98 @@ elif [ "$RUNTIME" = "python" ]; then
     fi
 
 # ============================================================
-# Java backend
+# Java backend (Spring Boot / generic JAR / WAR)
 # ============================================================
 elif [ "$RUNTIME" = "java" ]; then
-    JAR=$(find "$APP_ROOT" -name "*.jar" -type f | head -1)
-    if [ -n "$JAR" ]; then
-        nohup java -jar "$JAR" --server.port=$PORT > "$APP_DIR/java.log" 2>&1 &
-        echo $! > "$APP_DIR/.java.pid"
+    # Locate a usable Java runtime (prefer 21 > 17 > system)
+    JAVA_BIN=""
+    for candidate in \\
+        /usr/lib/jvm/java-21-amazon-corretto/bin/java \\
+        /usr/lib/jvm/java-17-amazon-corretto/bin/java \\
+        /usr/lib/jvm/default-java/bin/java \\
+        /usr/bin/java; do
+        if [ -x "$candidate" ]; then JAVA_BIN="$candidate"; break; fi
+    done
+    if [ -z "$JAVA_BIN" ]; then
+        echo "ERROR: no java runtime available on host"
+        exit 1
+    fi
+    echo "Java runtime: $JAVA_BIN ($($JAVA_BIN -version 2>&1 | head -1))"
+
+    # Pick the deployable archive. Prefer a Spring Boot fat JAR (largest
+    # JAR that is not a -sources/-javadoc/-tests/original- auxiliary).
+    ARCHIVE=""
+    while IFS= read -r candidate; do
+        base=$(basename "$candidate")
+        case "$base" in
+            *-sources.jar|*-javadoc.jar|*-tests.jar|original-*) continue ;;
+        esac
+        ARCHIVE="$candidate"
+        break
+    done < <(find "$APP_ROOT" -maxdepth 2 -type f \\( -name "*.jar" -o -name "*.war" -o -name "*.ear" \\) -printf "%s %p\\n" 2>/dev/null | sort -rn | cut -d' ' -f2-)
+
+    if [ -z "$ARCHIVE" ]; then
+        echo "ERROR: no deployable JAR/WAR/EAR found under $APP_ROOT"
+        exit 1
+    fi
+    echo "Java archive: $ARCHIVE"
+
+    # Stop previous process (pid file + pkill fallback)
+    if [ -f "$APP_DIR/.app.pid" ]; then
+        OLD_PID=$(cat "$APP_DIR/.app.pid" 2>/dev/null || true)
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            kill "$OLD_PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$OLD_PID" 2>/dev/null || true
+        fi
+        rm -f "$APP_DIR/.app.pid"
+    fi
+    if [ -f "$APP_DIR/.java.pid" ]; then
+        kill $(cat "$APP_DIR/.java.pid") 2>/dev/null || true
+        rm -f "$APP_DIR/.java.pid"
+    fi
+    pkill -f "java.*$OWNER--$REPO" 2>/dev/null || true
+
+    STDOUT_LOG="$APP_DIR/app.stdout.log"
+    STDERR_LOG="$APP_DIR/app.stderr.log"
+    : > "$STDOUT_LOG"
+    : > "$STDERR_LOG"
+
+    cd "$APP_ROOT"
+    # Pass the port both as env and Spring Boot command-line argument so
+    # either configuration pattern picks it up. Generic (non-Spring) JARs
+    # that ignore --server.port will still get SERVER_PORT/PORT from env.
+    SERVER_PORT=$PORT PORT=$PORT nohup "$JAVA_BIN" \\
+        -Dserver.port=$PORT \\
+        -Dspring.profiles.active=${{SPRING_PROFILES_ACTIVE:-prod}} \\
+        -jar "$ARCHIVE" \\
+        --server.port=$PORT \\
+        > "$STDOUT_LOG" 2> "$STDERR_LOG" < /dev/null &
+    APP_PID=$!
+    echo "$APP_PID" > "$APP_DIR/.app.pid"
+    disown "$APP_PID" 2>/dev/null || true
+
+    # Spring Boot apps can take 10-30s to warm up; allow a generous window.
+    BOUND=no
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+        sleep 1
+        if ss -tlnp 2>/dev/null | grep -q ":$PORT "; then
+            echo "Java app listening on port $PORT (pid $APP_PID) after ${{i}}s"
+            BOUND=yes
+            break
+        fi
+        if ! kill -0 "$APP_PID" 2>/dev/null; then
+            echo "Java process $APP_PID died before binding port $PORT"
+            break
+        fi
+    done
+    if [ "$BOUND" != "yes" ]; then
+        echo "ERROR: java app failed to bind port $PORT within 25s"
+        echo "--- stderr (last 80 lines) ---"
+        tail -80 "$STDERR_LOG" 2>/dev/null
+        echo "--- stdout (last 40 lines) ---"
+        tail -40 "$STDOUT_LOG" 2>/dev/null
+        exit 1
     fi
 fi
 
