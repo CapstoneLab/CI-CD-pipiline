@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from app.constants import BUILTIN_STEP_NAMES, RUNTIME_TYPE
+from app.utils.python import is_python_project
 
 
 REPO_WORKFLOW_CANDIDATES = (
@@ -79,13 +80,47 @@ def resolve_workflow_definition(
     for candidate in REPO_WORKFLOW_CANDIDATES:
         candidate_path = repo_dir / candidate
         if candidate_path.exists() and candidate_path.is_file():
-            return load_workflow_from_yaml(candidate_path)
+            loaded = load_workflow_from_yaml(candidate_path)
+            return _reconcile_workflow_runtime(loaded, repo_dir)
 
+    detected_runtime = detect_repo_runtime(repo_dir)
     generated_path = materialize_workflow_template(
         target_path=repo_dir / DEFAULT_REPO_WORKFLOW_PATH,
         base_dir=base_dir,
+        runtime_type=detected_runtime,
     )
-    return load_workflow_from_yaml(generated_path)
+    return _reconcile_workflow_runtime(load_workflow_from_yaml(generated_path), repo_dir)
+
+
+def detect_repo_runtime(repo_dir: Path) -> str:
+    if (repo_dir / "package.json").exists():
+        return "node"
+    if is_python_project(repo_dir):
+        return "python"
+    return RUNTIME_TYPE
+
+
+def _runtime_markers_present(runtime_type: str, repo_dir: Path) -> bool:
+    if runtime_type == "node":
+        return (repo_dir / "package.json").exists()
+    if runtime_type == "python":
+        return is_python_project(repo_dir)
+    return False
+
+
+def _reconcile_workflow_runtime(workflow: WorkflowDefinition, repo_dir: Path) -> WorkflowDefinition:
+    declared = workflow.runtime_type
+    if _runtime_markers_present(declared, repo_dir):
+        return workflow
+
+    detected = detect_repo_runtime(repo_dir)
+    if detected == declared:
+        return workflow
+    if not _runtime_markers_present(detected, repo_dir):
+        return workflow
+
+    workflow.runtime_type = detected
+    return workflow
 
 
 def load_workflow_from_yaml(file_path: Path) -> WorkflowDefinition:
@@ -216,27 +251,37 @@ def _resolve_explicit_workflow_path(workflow_path: str, repo_dir: Path, base_dir
     )
 
 
-def materialize_workflow_template(target_path: Path, base_dir: Path) -> Path:
+def materialize_workflow_template(
+    target_path: Path,
+    base_dir: Path,
+    runtime_type: str = RUNTIME_TYPE,
+) -> Path:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if not target_path.exists():
-        target_path.write_text(_load_template_text(base_dir), encoding="utf-8")
+        target_path.write_text(
+            _load_template_text(base_dir, runtime_type=runtime_type),
+            encoding="utf-8",
+        )
     return target_path
 
 
-def _load_template_text(base_dir: Path) -> str:
-    for relative_path in ENGINE_WORKFLOW_TEMPLATE_CANDIDATES:
-        candidate = base_dir / relative_path
-        if candidate.exists() and candidate.is_file():
-            return candidate.read_text(encoding="utf-8")
+def _load_template_text(base_dir: Path, runtime_type: str = RUNTIME_TYPE) -> str:
+    # For non-node runtimes we always emit the built-in template for that runtime
+    # instead of falling back to the engine's node-oriented example files.
+    if runtime_type == RUNTIME_TYPE:
+        for relative_path in ENGINE_WORKFLOW_TEMPLATE_CANDIDATES:
+            candidate = base_dir / relative_path
+            if candidate.exists() and candidate.is_file():
+                return candidate.read_text(encoding="utf-8")
 
-    return _default_template_yaml_text()
+    return _default_template_yaml_text(runtime_type=runtime_type)
 
 
-def _default_template_yaml_text() -> str:
+def _default_template_yaml_text(runtime_type: str = RUNTIME_TYPE) -> str:
     return (
         "name: default-generated-workflow\n"
         "runtime:\n"
-        "  type: node\n"
+        f"  type: {runtime_type}\n"
         "steps:\n"
         "  - name: install\n"
         "    uses: install\n"
@@ -257,6 +302,9 @@ def _default_template_yaml_text() -> str:
         "\n"
         "  - name: build\n"
         "    uses: build\n"
+        "\n"
+        "  - name: deploy\n"
+        "    uses: deploy\n"
     )
 
 

@@ -9,6 +9,44 @@ from pathlib import Path
 
 SUPPORTED_PACKAGE_MANAGERS = {"npm", "yarn", "pnpm"}
 
+# Packages that are provided and invoked by the engine itself, so they
+# must NOT be re-installed as project dependencies.
+ENGINE_MANAGED_NODE_PACKAGES = {"semgrep", "gitleaks", "@semgrep/semgrep"}
+
+
+def strip_engine_managed_dependencies(repo_dir: Path) -> list[str]:
+    """Remove engine-managed tools from ``package.json``.
+
+    Scans ``dependencies``, ``devDependencies``, ``optionalDependencies``
+    and ``peerDependencies`` for any package in
+    :data:`ENGINE_MANAGED_NODE_PACKAGES` (case-insensitive). Returns the
+    removed entries as ``"{field}.{pkg}"`` strings. The file is only
+    rewritten when something actually changed.
+    """
+    pkg_file = repo_dir / "package.json"
+    if not pkg_file.exists():
+        return []
+    try:
+        data = json.loads(pkg_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    removed: list[str] = []
+    for field in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        deps = data.get(field)
+        if not isinstance(deps, dict):
+            continue
+        for pkg_name in list(deps.keys()):
+            if pkg_name.lower() in ENGINE_MANAGED_NODE_PACKAGES:
+                del deps[pkg_name]
+                removed.append(f"{field}.{pkg_name}")
+
+    if removed:
+        pkg_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return removed
+
 
 def read_package_json(repo_dir: Path) -> dict:
     package_json = repo_dir / "package.json"
