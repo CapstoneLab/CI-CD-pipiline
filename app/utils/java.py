@@ -90,30 +90,57 @@ def detect_build_tool(repo_dir: Path) -> str:
     return "maven"
 
 
+def _gradle_wrapper_is_usable(repo_dir: Path) -> bool:
+    """A Gradle wrapper is only usable if both the launcher script and the
+    bootstrap jar are present. Repos occasionally commit ``gradlew`` but
+    forget ``gradle/wrapper/gradle-wrapper.jar`` (or ship a hand-edited
+    script that mangles ``DEFAULT_JVM_OPTS`` quoting), which makes the
+    wrapper crash before it can download Gradle. In those cases we want to
+    silently fall back to the host-installed ``gradle``."""
+    script = repo_dir / ("gradlew.bat" if os.name == "nt" else "gradlew")
+    if not script.exists():
+        return False
+    wrapper_jar = repo_dir / "gradle" / "wrapper" / "gradle-wrapper.jar"
+    wrapper_props = repo_dir / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    return wrapper_jar.exists() and wrapper_props.exists()
+
+
+def _maven_wrapper_is_usable(repo_dir: Path) -> bool:
+    """Same idea as the Gradle check: ``mvnw`` needs either the legacy
+    ``.mvn/wrapper/maven-wrapper.jar`` or the newer ``maven-wrapper.properties``
+    bootstrap to actually function."""
+    script = repo_dir / ("mvnw.cmd" if os.name == "nt" else "mvnw")
+    if not script.exists():
+        return False
+    wrapper_dir = repo_dir / ".mvn" / "wrapper"
+    return (wrapper_dir / "maven-wrapper.properties").exists() or (
+        wrapper_dir / "maven-wrapper.jar"
+    ).exists()
+
+
 def has_wrapper(repo_dir: Path, build_tool: str) -> bool:
     if build_tool == "gradle":
-        return (repo_dir / "gradlew").exists() or (repo_dir / "gradlew.bat").exists()
+        return _gradle_wrapper_is_usable(repo_dir)
     if build_tool == "maven":
-        return (repo_dir / "mvnw").exists() or (repo_dir / "mvnw.cmd").exists()
+        return _maven_wrapper_is_usable(repo_dir)
     return False
 
 
 def build_tool_executable(repo_dir: Path, build_tool: str) -> str:
     """Resolve the tool invocation. Prefers the project-local wrapper
     (``./gradlew``, ``./mvnw``) over a host-wide install so each repo uses
-    its pinned build tool version."""
+    its pinned build tool version. Falls back to the host binary when the
+    wrapper is missing or broken (see ``_gradle_wrapper_is_usable``)."""
     if build_tool == "gradle":
-        if os.name == "nt" and (repo_dir / "gradlew.bat").exists():
-            return str(repo_dir / "gradlew.bat")
-        if (repo_dir / "gradlew").exists():
-            return str(repo_dir / "gradlew")
+        if _gradle_wrapper_is_usable(repo_dir):
+            wrapper = "gradlew.bat" if os.name == "nt" else "gradlew"
+            return str(repo_dir / wrapper)
         return "gradle.bat" if os.name == "nt" else "gradle"
 
     if build_tool == "maven":
-        if os.name == "nt" and (repo_dir / "mvnw.cmd").exists():
-            return str(repo_dir / "mvnw.cmd")
-        if (repo_dir / "mvnw").exists():
-            return str(repo_dir / "mvnw")
+        if _maven_wrapper_is_usable(repo_dir):
+            wrapper = "mvnw.cmd" if os.name == "nt" else "mvnw"
+            return str(repo_dir / wrapper)
         return "mvn.cmd" if os.name == "nt" else "mvn"
 
     return build_tool
