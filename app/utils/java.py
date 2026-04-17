@@ -199,6 +199,26 @@ def install_command(repo_dir: Path, build_tool: str) -> list[str]:
     return [exe]
 
 
+def install_command_fallbacks(repo_dir: Path, build_tool: str) -> list[list[str]]:
+    """Ordered list of fallback install commands when the primary fails."""
+    exe = build_tool_executable(repo_dir, build_tool)
+
+    if build_tool == "maven":
+        return [
+            [exe, "-B", "-ntp", "-DskipTests", "compile"],
+            [exe, "-B", "-ntp", "-DskipTests", "validate"],
+        ]
+
+    if build_tool == "gradle":
+        return [
+            [exe, "--no-daemon", "-q", "build", "--dry-run"],
+            [exe, "--no-daemon", "-q", "classes"],
+            [exe, "--no-daemon", "-q", "help"],
+        ]
+
+    return []
+
+
 def test_command(repo_dir: Path, build_tool: str) -> list[str]:
     exe = build_tool_executable(repo_dir, build_tool)
 
@@ -218,12 +238,31 @@ def build_command(repo_dir: Path, build_tool: str) -> list[str]:
         return [exe, "-B", "-ntp", "-DskipTests", "package"]
 
     if build_tool == "gradle":
-        # Prefer `bootJar` when Spring Boot is detected; fall back to `build`.
         if is_spring_boot_project(repo_dir):
             return [exe, "--no-daemon", "-x", "test", "bootJar"]
         return [exe, "--no-daemon", "-x", "test", "build"]
 
     return [exe, "build"]
+
+
+def build_command_fallbacks(repo_dir: Path, build_tool: str) -> list[list[str]]:
+    """Ordered list of fallback build commands to try when the primary fails."""
+    exe = build_tool_executable(repo_dir, build_tool)
+
+    if build_tool == "maven":
+        return [
+            [exe, "-B", "-ntp", "-DskipTests", "-Dmaven.test.skip=true", "package"],
+        ]
+
+    if build_tool == "gradle":
+        fallbacks: list[list[str]] = []
+        if is_spring_boot_project(repo_dir):
+            fallbacks.append([exe, "--no-daemon", "-x", "test", "build"])
+        fallbacks.append([exe, "--no-daemon", "-x", "test", "assemble"])
+        fallbacks.append([exe, "--no-daemon", "-x", "test", "jar"])
+        return fallbacks
+
+    return []
 
 
 def is_spring_boot_project(repo_dir: Path) -> bool:
@@ -260,20 +299,37 @@ def artifact_directories(build_tool: str) -> list[str]:
 
 
 _ARTIFACT_PATTERNS = ("*.jar", "*.war", "*.ear")
-_ARTIFACT_EXCLUDES = (
+_ARTIFACT_PATTERNS = ("*.jar", "*.war", "*.ear")
+_ARTIFACT_SUFFIX_EXCLUDES = (
     "-sources.jar",
     "-javadoc.jar",
     "-tests.jar",
+    "-plain.jar",
+    "-slim.jar",
+    "-stubs.jar",
+    "-test-fixtures.jar",
+    "-all-deps.jar",
+    "-dep.jar",
+    "-empty.jar",
+    "-mock.jar",
+)
+_ARTIFACT_PREFIX_EXCLUDES = (
     "original-",
+)
+_ARTIFACT_CONTAINS_EXCLUDES = (
+    "-SNAPSHOT-sources",
+    "-SNAPSHOT-javadoc",
 )
 
 
 def is_deployable_artifact(path: Path) -> bool:
     """Exclude intermediate/auxiliary archives that shouldn't be deployed."""
     name = path.name
-    if any(name.endswith(suffix) for suffix in _ARTIFACT_EXCLUDES if suffix.startswith("-")):
+    if any(name.endswith(suffix) for suffix in _ARTIFACT_SUFFIX_EXCLUDES):
         return False
-    if any(name.startswith(prefix) for prefix in _ARTIFACT_EXCLUDES if not prefix.startswith("-")):
+    if any(name.startswith(prefix) for prefix in _ARTIFACT_PREFIX_EXCLUDES):
+        return False
+    if any(fragment in name for fragment in _ARTIFACT_CONTAINS_EXCLUDES):
         return False
     return True
 
@@ -298,16 +354,40 @@ def has_test_files(repo_dir: Path) -> bool:
 
 
 def java_home_hint() -> str | None:
-    """Return a likely JAVA_HOME candidate for the current platform so the
-    engine can surface helpful errors when no JDK is installed."""
+    """Return a likely JAVA_HOME candidate for the current platform."""
     if "JAVA_HOME" in os.environ:
         return os.environ["JAVA_HOME"]
     candidates = [
         "/usr/lib/jvm/java-21-amazon-corretto",
+        "/usr/lib/jvm/java-21-openjdk-amd64",
+        "/usr/lib/jvm/java-21-openjdk",
         "/usr/lib/jvm/java-17-amazon-corretto",
+        "/usr/lib/jvm/java-17-openjdk-amd64",
+        "/usr/lib/jvm/java-17-openjdk",
+        "/usr/lib/jvm/java-11-amazon-corretto",
+        "/usr/lib/jvm/java-11-openjdk-amd64",
+        "/usr/lib/jvm/java-11-openjdk",
         "/usr/lib/jvm/default-java",
+        "/usr/lib/jvm/default",
     ]
     for candidate in candidates:
         if Path(candidate).exists():
             return candidate
+    jvm_dir = Path("/usr/lib/jvm")
+    if jvm_dir.is_dir():
+        try:
+            for child in sorted(jvm_dir.iterdir(), reverse=True):
+                if child.is_dir() and (child / "bin" / "java").exists():
+                    return str(child)
+        except OSError:
+            pass
     return None
+
+
+def setup_java_env() -> dict[str, str]:
+    """Build environment variables for Java commands."""
+    env: dict[str, str] = {}
+    java_home = java_home_hint()
+    if java_home:
+        env["JAVA_HOME"] = java_home
+    return env

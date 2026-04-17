@@ -19,6 +19,7 @@ from app.utils.node import (
 from app.utils.java import (
     artifact_directories as java_artifact_directories,
     build_command as java_build_command,
+    build_command_fallbacks as java_build_command_fallbacks,
     build_tool_executable as java_build_tool_executable,
     detect_build_tool as java_detect_build_tool,
     ensure_wrapper_executable as java_ensure_wrapper_executable,
@@ -27,6 +28,7 @@ from app.utils.java import (
     is_command_available as java_is_command_available,
     is_deployable_artifact as java_is_deployable_artifact,
     is_java_project,
+    setup_java_env,
 )
 from app.utils.python import (
     AsgiEntryPoint,
@@ -394,14 +396,25 @@ def _run_java_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> Step
             ),
         )
 
+    java_env = setup_java_env()
+
     cmd = java_build_command(project_root, build_tool)
-    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
+    result = run_command(command=cmd, cwd=project_root, log_file=log_file, env=java_env or None)
     if result.exit_code != 0:
-        return StepRunResult(
-            status="failed",
-            exit_code=result.exit_code,
-            summary_message=f"java build failed ({build_tool})",
-        )
+        fallbacks = java_build_command_fallbacks(project_root, build_tool)
+        succeeded = False
+        for fallback_cmd in fallbacks:
+            append_log(log_file, f"Primary build failed; trying fallback: {' '.join(fallback_cmd)}")
+            fallback_result = run_command(command=fallback_cmd, cwd=project_root, log_file=log_file, env=java_env or None)
+            if fallback_result.exit_code == 0:
+                succeeded = True
+                break
+        if not succeeded:
+            return StepRunResult(
+                status="failed",
+                exit_code=result.exit_code,
+                summary_message=f"java build failed ({build_tool})",
+            )
 
     collected = _collect_java_build_artifacts(
         project_root=project_root,

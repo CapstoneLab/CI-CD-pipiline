@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.callback import build_step_callback_payload, collect_logs, post_step_callback
 from app.constants import RUNTIME_TYPE
 from app.models import PipelineRun, PipelineStep, SecurityFinding, SecuritySummary, StepRunResult, now_iso
 from app.steps.build import run_build
@@ -18,9 +19,18 @@ from app.workflow import WorkflowStepDefinition, resolve_workflow_definition
 
 
 class LocalOrchestrator:
-    def __init__(self, base_dir: Path) -> None:
+    def __init__(
+        self,
+        base_dir: Path,
+        callback_url: str = "",
+        callback_token: str = "",
+        job_id: str = "",
+    ) -> None:
         self.base_dir = base_dir
         self._current_runtime_type: str = RUNTIME_TYPE
+        self._callback_url = callback_url
+        self._callback_token = callback_token
+        self._job_id = job_id
 
     def run(self, repo_url: str, branch: str | None, workflow_path: str | None = None) -> tuple[PipelineRun, Path]:
         run_id = make_run_id(self.base_dir)
@@ -85,6 +95,8 @@ class LocalOrchestrator:
                     exit_code=1,
                     summary_message=f"Workflow resolution failed: {exc}",
                 ),
+                repo_url=repo_url,
+                branch=branch,
             )
             pipeline_run.status = "failed"
             pipeline_run.finished_at = now_iso()
@@ -181,7 +193,14 @@ class LocalOrchestrator:
                 summary_message=f"Unhandled exception: {exc}",
             )
 
-        self._record_step_result(pipeline_run=pipeline_run, run_dir=run_dir, step=step, result=result)
+        self._record_step_result(
+            pipeline_run=pipeline_run,
+            run_dir=run_dir,
+            step=step,
+            result=result,
+            repo_url=repo_url,
+            branch=branch,
+        )
         return result
 
     def _record_step_result(
@@ -190,6 +209,8 @@ class LocalOrchestrator:
         run_dir: Path,
         step: PipelineStep,
         result: StepRunResult,
+        repo_url: str = "",
+        branch: str | None = None,
     ) -> None:
         step.finished_at = now_iso()
         step.status = result.status
@@ -203,6 +224,47 @@ class LocalOrchestrator:
             append_log(step_log_path, f"[step_exit_code] {step.exit_code if step.exit_code is not None else 'null'}")
 
         self._write_pipeline_result(run_dir, pipeline_run)
+        self._send_step_callback(pipeline_run, run_dir, step, repo_url, branch)
+
+    def _send_step_callback(
+        self,
+        pipeline_run: PipelineRun,
+        run_dir: Path,
+        step: PipelineStep,
+        repo_url: str,
+        branch: str | None,
+    ) -> None:
+        if not self._callback_url or not self._callback_token:
+            return
+
+        step_log: list[str] = []
+        if step.log_file:
+            log_path = self.base_dir / step.log_file
+            if log_path.exists():
+                try:
+                    step_log = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    pass
+
+        job_id = self._job_id or pipeline_run.run_id
+        payload = build_step_callback_payload(
+            job_id=job_id,
+            repo_url=repo_url,
+            branch=branch or "main",
+            pipeline_run=pipeline_run,
+            step=step,
+            step_log=step_log,
+        )
+
+        ok, detail = post_step_callback(
+            callback_url=self._callback_url,
+            callback_token=self._callback_token,
+            payload=payload,
+        )
+        if ok:
+            print(f"  -> step callback sent: {step.step_name}")
+        else:
+            print(f"  -> step callback failed: {step.step_name} ({detail})")
 
     @staticmethod
     def _mark_remaining_steps_skipped(

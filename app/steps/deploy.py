@@ -827,15 +827,29 @@ elif [ "$RUNTIME" = "python" ]; then
 # Java backend (Spring Boot / generic JAR / WAR)
 # ============================================================
 elif [ "$RUNTIME" = "java" ]; then
-    # Locate a usable Java runtime (prefer 21 > 17 > system)
+    # Locate a usable Java runtime (prefer 21 > 17 > 11 > system > auto-discover)
     JAVA_BIN=""
     for candidate in \\
         /usr/lib/jvm/java-21-amazon-corretto/bin/java \\
+        /usr/lib/jvm/java-21-openjdk-amd64/bin/java \\
+        /usr/lib/jvm/java-21-openjdk/bin/java \\
         /usr/lib/jvm/java-17-amazon-corretto/bin/java \\
+        /usr/lib/jvm/java-17-openjdk-amd64/bin/java \\
+        /usr/lib/jvm/java-17-openjdk/bin/java \\
+        /usr/lib/jvm/java-11-amazon-corretto/bin/java \\
+        /usr/lib/jvm/java-11-openjdk-amd64/bin/java \\
+        /usr/lib/jvm/java-11-openjdk/bin/java \\
         /usr/lib/jvm/default-java/bin/java \\
+        /usr/lib/jvm/default/bin/java \\
         /usr/bin/java; do
         if [ -x "$candidate" ]; then JAVA_BIN="$candidate"; break; fi
     done
+    if [ -z "$JAVA_BIN" ]; then
+        # Auto-discover: scan /usr/lib/jvm for any JDK
+        if [ -d /usr/lib/jvm ]; then
+            JAVA_BIN=$(find /usr/lib/jvm -name "java" -path "*/bin/java" -type f 2>/dev/null | sort -r | head -1 || true)
+        fi
+    fi
     if [ -z "$JAVA_BIN" ]; then
         echo "ERROR: no java runtime available on host"
         exit 1
@@ -848,7 +862,7 @@ elif [ "$RUNTIME" = "java" ]; then
     while IFS= read -r candidate; do
         base=$(basename "$candidate")
         case "$base" in
-            *-sources.jar|*-javadoc.jar|*-tests.jar|original-*) continue ;;
+            *-sources.jar|*-javadoc.jar|*-tests.jar|*-plain.jar|*-slim.jar|*-stubs.jar|*-test-fixtures.jar|*-empty.jar|*-mock.jar|original-*) continue ;;
         esac
         ARCHIVE="$candidate"
         break

@@ -38,25 +38,33 @@ def main() -> int:
     base_dir = Path(__file__).resolve().parent
     branch = args.branch or "main"
 
-    orchestrator = LocalOrchestrator(base_dir=base_dir)
+    callback_url = args.callback_url.strip()
+    callback_token = args.callback_token.strip()
+    job_id = args.job_id.strip()
+
+    orchestrator = LocalOrchestrator(
+        base_dir=base_dir,
+        callback_url=callback_url,
+        callback_token=callback_token,
+        job_id=job_id,
+    )
     pipeline_run, run_dir = orchestrator.run(
         repo_url=args.repo,
         branch=branch,
         workflow_path=args.workflow or None,
     )
 
-    callback_url = args.callback_url.strip()
-    callback_token = args.callback_token.strip()
     if callback_url:
-        job_id = args.job_id.strip() or pipeline_run.run_id
+        final_job_id = job_id or pipeline_run.run_id
         logs = collect_logs(run_dir, pipeline_run=pipeline_run)
         payload = build_callback_payload(
-            job_id=job_id,
+            job_id=final_job_id,
             repo_url=args.repo,
             branch=branch,
             pipeline_run=pipeline_run,
             logs=logs,
         )
+        payload["type"] = "pipeline_complete"
 
         callback_result_path = save_callback_payload(run_dir, payload)
 

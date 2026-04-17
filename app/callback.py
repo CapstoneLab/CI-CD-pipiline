@@ -180,6 +180,55 @@ def _post_once(
         return False, f"unexpected error: {exc}"
 
 
+def build_step_callback_payload(
+    *,
+    job_id: str,
+    repo_url: str,
+    branch: str,
+    pipeline_run: PipelineRun,
+    step: Any,
+    step_log: list[str],
+) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "type": "step_complete",
+        "pipeline_status": _normalize_status(pipeline_run.status),
+        "repo_url": repo_url,
+        "branch": branch,
+        "step": {
+            "name": step.step_name,
+            "status": step.status,
+            "exit_code": step.exit_code,
+            "summary": step.summary_message,
+            "started_at": step.started_at,
+            "finished_at": step.finished_at,
+            "log_file": step.log_file,
+            "logs": step_log,
+        },
+        "metadata": {
+            "executor": "ubuntu-ci-engine",
+            "run_id": pipeline_run.run_id,
+            "workflow_name": pipeline_run.workflow_name,
+            "workflow_source": pipeline_run.workflow_source,
+        },
+    }
+
+
+def post_step_callback(
+    *,
+    callback_url: str,
+    callback_token: str,
+    payload: dict[str, Any],
+    timeout_sec: int = 10,
+) -> tuple[bool, str]:
+    return _post_once(
+        callback_url=callback_url,
+        callback_token=callback_token,
+        payload=payload,
+        timeout_sec=timeout_sec,
+    )
+
+
 def _normalize_status(status: str) -> str:
     if status in {"success", "failed", "running"}:
         return status

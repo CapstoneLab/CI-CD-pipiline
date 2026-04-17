@@ -24,8 +24,10 @@ from app.utils.java import (
     find_java_project_root,
     has_wrapper as java_has_wrapper,
     install_command as java_install_command,
+    install_command_fallbacks as java_install_command_fallbacks,
     is_command_available as java_is_command_available,
     is_java_project,
+    setup_java_env,
 )
 from app.utils.python import (
     create_venv_command,
@@ -327,8 +329,10 @@ def _run_java_install(repo_dir: Path, log_file: Path) -> StepRunResult:
             ),
         )
 
+    java_env = setup_java_env()
+
     cmd = java_install_command(project_root, build_tool)
-    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
+    result = run_command(command=cmd, cwd=project_root, log_file=log_file, env=java_env or None)
     if result.exit_code == 0:
         wrapper_note = " via wrapper" if using_wrapper else ""
         return StepRunResult(
@@ -336,6 +340,17 @@ def _run_java_install(repo_dir: Path, log_file: Path) -> StepRunResult:
             exit_code=0,
             summary_message=f"java dependencies resolved ({build_tool}{wrapper_note})",
         )
+
+    for fallback_cmd in java_install_command_fallbacks(project_root, build_tool):
+        append_log(log_file, f"Primary install failed; trying fallback: {' '.join(fallback_cmd)}")
+        fallback_result = run_command(command=fallback_cmd, cwd=project_root, log_file=log_file, env=java_env or None)
+        if fallback_result.exit_code == 0:
+            wrapper_note = " via wrapper" if using_wrapper else ""
+            return StepRunResult(
+                status="success",
+                exit_code=0,
+                summary_message=f"java dependencies resolved ({build_tool}{wrapper_note}, fallback)",
+            )
 
     return StepRunResult(
         status="failed",

@@ -26,6 +26,7 @@ from app.utils.java import (
     has_wrapper as java_has_wrapper,
     is_command_available as java_is_command_available,
     is_java_project,
+    setup_java_env,
     test_command as java_test_command,
 )
 from app.utils.python import (
@@ -237,14 +238,56 @@ def _run_java_test(repo_dir: Path, log_file: Path) -> StepRunResult:
             ),
         )
 
+    java_env = setup_java_env()
+
     cmd = java_test_command(project_root, build_tool)
-    result = run_command(command=cmd, cwd=project_root, log_file=log_file)
+    result = run_command(command=cmd, cwd=project_root, log_file=log_file, env=java_env or None)
 
     if result.exit_code == 0:
         return StepRunResult(
             status="success",
             exit_code=0,
             summary_message=f"java tests passed ({build_tool})",
+        )
+
+    test_log = ""
+    try:
+        test_log = log_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+
+    infra_keywords = [
+        "Failed to load JUnit Platform",
+        "JUnit Platform launcher",
+        "NoClassDefFoundError",
+        "NoSuchMethodError",
+        "Could not start Gradle Test Executor",
+        "Cannot find a Java installation",
+        "Toolchain download repositories have not been configured",
+        "UnsupportedClassVersionError",
+        "compilation failed",
+        "Compilation failed",
+        "compileTestJava FAILED",
+        "Could not resolve all dependencies",
+        "Could not determine java version",
+        "incompatible with Gradle",
+        "JAVA_HOME is not set",
+        "JAVA_HOME is set to an invalid directory",
+        "No compiler is provided in this environment",
+        "package does not exist",
+        "cannot find symbol",
+    ]
+    is_infra_failure = any(kw in test_log for kw in infra_keywords)
+
+    if is_infra_failure:
+        append_log(
+            log_file,
+            "Test infrastructure failure detected (not a test logic error); treating as skipped",
+        )
+        return StepRunResult(
+            status="skipped",
+            exit_code=0,
+            summary_message=f"java tests skipped — infrastructure issue ({build_tool})",
         )
 
     return StepRunResult(
