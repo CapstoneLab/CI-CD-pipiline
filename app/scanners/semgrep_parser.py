@@ -5,6 +5,16 @@ import re
 from pathlib import Path
 
 from app.models import SecurityFinding, SecuritySummary
+from app.security_catalog import lookup_by_cwe, normalize_cwe
+
+
+def _extract_cwe(extra: dict) -> str | None:
+    metadata = extra.get("metadata", {}) or {}
+    for candidate in (metadata.get("cwe"), metadata.get("cwe_id"), extra.get("cwe")):
+        normalized = normalize_cwe(candidate)
+        if normalized:
+            return normalized
+    return None
 
 
 def _normalize_severity(extra: dict) -> str:
@@ -116,8 +126,18 @@ def parse_semgrep_report(report_file: Path) -> tuple[SecuritySummary, list[Secur
 
     for item in data.get("results", []):
         extra = item.get("extra", {})
-        severity = _normalize_severity(extra)
         cvss_score = _extract_cvss_score(extra)
+
+        # Grade is derived from the CWE via the 16-item catalog. semgrep's own
+        # severity is only a fallback for CWEs outside the catalog.
+        cwe = _extract_cwe(extra)
+        catalog_item = lookup_by_cwe(cwe)
+        if catalog_item is not None:
+            severity = catalog_item.grade
+            policy_item = catalog_item.key
+        else:
+            severity = _normalize_severity(extra)
+            policy_item = None
 
         if cvss_score is not None:
             max_cvss_score = cvss_score if max_cvss_score is None else max(max_cvss_score, cvss_score)
@@ -141,6 +161,9 @@ def parse_semgrep_report(report_file: Path) -> tuple[SecuritySummary, list[Secur
                 line_number=int(item.get("start", {}).get("line", 0) or 0),
                 message=str(extra.get("message", "Semgrep finding")),
                 cvss_score=cvss_score,
+                cwe=cwe,
+                policy_item=policy_item,
+                column_number=int(item.get("start", {}).get("col", 0) or 0) or None,
             )
         )
 

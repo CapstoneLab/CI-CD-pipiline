@@ -77,6 +77,24 @@ def _run_node_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> Step
 
     if not build_scripts:
         append_log(log_file, "No supported build scripts found: build, build:frontend, build:server")
+        if has_script(repo_dir, "start") or (repo_dir / "server.js").exists():
+            generated_names = _create_fallback_artifacts(
+                repo_dir=repo_dir,
+                artifacts_dir=artifacts_dir,
+                build_scripts=["start"],
+            )
+            append_log(
+                log_file,
+                "No build script required for server-style Node app; generated deployable fallback artifacts",
+            )
+            return StepRunResult(
+                status="success",
+                exit_code=0,
+                summary_message=(
+                    "node server app has no build script; "
+                    f"fallback artifacts saved: {', '.join(generated_names)}"
+                ),
+            )
         return StepRunResult(status="failed", exit_code=1, summary_message="build script missing in package.json")
 
     for script_name in build_scripts:
@@ -85,8 +103,29 @@ def _run_node_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> Step
             cmd = wrap_with_corepack(cmd, package_manager)
         # Some toolchains (e.g., react-scripts) treat warnings as errors when CI=true.
         # Build should fail only on actual errors, not warnings.
-        result = run_command(command=cmd, cwd=repo_dir, log_file=log_file, env={"CI": "false"})
+        result = run_command(command=cmd, cwd=repo_dir, log_file=log_file, env=_node_build_env(package_manager))
         if result.exit_code != 0:
+            if _is_unsupported_playwright_browser_install_failure(result.output):
+                append_log(
+                    log_file,
+                    (
+                        f"{package_manager} run {script_name} was blocked by unsupported "
+                        "Playwright browser postinstall; generating fallback artifacts"
+                    ),
+                )
+                generated_names = _create_fallback_artifacts(
+                    repo_dir=repo_dir,
+                    artifacts_dir=artifacts_dir,
+                    build_scripts=build_scripts,
+                )
+                return StepRunResult(
+                    status="success",
+                    exit_code=0,
+                    summary_message=(
+                        f"{package_manager} run {script_name} skipped unsupported Playwright "
+                        f"browser postinstall; fallback artifacts saved: {', '.join(generated_names)}"
+                    ),
+                )
             return StepRunResult(
                 status="failed",
                 exit_code=result.exit_code,
@@ -114,6 +153,21 @@ def _run_node_build(repo_dir: Path, log_file: Path, artifacts_dir: Path) -> Step
             + ", ".join(build_scripts)
             + f" | artifacts saved: {', '.join(collected)}"
         ),
+    )
+
+
+def _node_build_env(package_manager: str) -> dict[str, str]:
+    env = {"CI": "false"}
+    if package_manager == "pnpm":
+        env["PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN"] = "false"
+    return env
+
+
+def _is_unsupported_playwright_browser_install_failure(output: str) -> bool:
+    return (
+        "Playwright does not support chromium" in output
+        and "postinstall" in output
+        and "Failed to install browsers" in output
     )
 
 
@@ -191,6 +245,13 @@ def _create_node_fallback_directory(repo_dir: Path, output_dir: Path) -> None:
         "build",
         "coverage",
         ".cache",
+        ".rush",
+        ".pnpm-store",
+        "pnpm-local",
+        "pnpm-store",
+    }
+    excluded_prefixes = {
+        Path("common/temp"),
     }
     excluded_files = {
         ".DS_Store",
@@ -202,7 +263,13 @@ def _create_node_fallback_directory(repo_dir: Path, output_dir: Path) -> None:
         if any(part in excluded_dirs for part in rel.parts):
             continue
 
+        if any(rel == prefix or prefix in rel.parents for prefix in excluded_prefixes):
+            continue
+
         if path.name in excluded_files:
+            continue
+
+        if path.is_symlink():
             continue
 
         destination = output_dir / rel

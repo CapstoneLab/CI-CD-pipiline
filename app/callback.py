@@ -2,12 +2,127 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib import error, request
 
 from app.models import PipelineRun
 from app.utils.filesystem import save_json
+
+
+MAX_CALLBACK_LOG_LINES = 250
+MAX_CALLBACK_FINDINGS = 120
+MAX_CALLBACK_SNIPPET_CHARS = 1200
+MAX_CALLBACK_FIELD_CHARS = 4000
+
+
+# step_name -> step_type for the backend's step-progress tracking.
+_STEP_TYPE_MAP = {
+    "clone": "clone",
+    "install": "install",
+    "test": "test",
+    "build": "build",
+    "deploy": "deploy",
+    "security_gate": "security",
+    "env_check": "env",
+    "resolve_workflow": "workflow",
+}
+
+
+def _step_type(step_name: str) -> str:
+    name = (step_name or "").lower()
+    if name in _STEP_TYPE_MAP:
+        return _STEP_TYPE_MAP[name]
+    if "security" in name:
+        return "security"
+    if "build" in name:
+        return "build"
+    if "test" in name:
+        return "test"
+    if "deploy" in name:
+        return "deploy"
+    if "install" in name:
+        return "install"
+    return "command"
+
+
+def _duration_secs(started_at: str | None, finished_at: str | None) -> float | None:
+    if not started_at or not finished_at:
+        return None
+    try:
+        start = datetime.fromisoformat(started_at)
+        end = datetime.fromisoformat(finished_at)
+    except ValueError:
+        return None
+    return round((end - start).total_seconds(), 1)
+
+
+def _serialize_step(step: Any) -> dict[str, Any]:
+    """Backend-facing step shape. Keeps legacy fields and adds the backend's
+    documented fields (step_name, step_type, duration_secs, error_message, metadata)."""
+    error_message = step.summary_message if step.status == "failed" else None
+    return {
+        "name": step.step_name,
+        "step_name": step.step_name,
+        "step_type": _step_type(step.step_name),
+        "status": step.status,
+        "exit_code": step.exit_code,
+        "summary": step.summary_message,
+        "error_message": error_message,
+        "started_at": step.started_at,
+        "finished_at": step.finished_at,
+        "duration_secs": _duration_secs(step.started_at, step.finished_at),
+        "log_file": step.log_file,
+        "metadata": {},
+    }
+
+
+def _truncate_text(value: Any, max_chars: int) -> Any:
+    if not isinstance(value, str) or len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}...[truncated]"
+
+
+def compact_security_findings(
+    findings: list[dict[str, Any]] | None,
+    *,
+    max_items: int = MAX_CALLBACK_FINDINGS,
+    max_snippet_chars: int = MAX_CALLBACK_SNIPPET_CHARS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Shrink callback-only findings while preserving full artifacts on disk."""
+    source = findings or []
+    compacted: list[dict[str, Any]] = []
+    snippets_truncated = 0
+    fields_truncated = 0
+
+    for finding in source[:max_items]:
+        if not isinstance(finding, dict):
+            continue
+
+        item = dict(finding)
+        snippet = item.get("code_snippet")
+        truncated_snippet = _truncate_text(snippet, max_snippet_chars)
+        if truncated_snippet != snippet:
+            snippets_truncated += 1
+            item["code_snippet"] = truncated_snippet
+
+        for key in ("message", "ai_recommendation"):
+            before = item.get(key)
+            after = _truncate_text(before, MAX_CALLBACK_FIELD_CHARS)
+            if after != before:
+                fields_truncated += 1
+                item[key] = after
+
+        compacted.append(item)
+
+    return compacted, {
+        "security_findings_original_count": len(source),
+        "security_findings_sent_count": len(compacted),
+        "security_findings_truncated": len(source) > len(compacted),
+        "security_snippets_truncated_count": snippets_truncated,
+        "security_text_fields_truncated_count": fields_truncated,
+    }
 
 
 def build_callback_payload(
@@ -21,6 +136,11 @@ def build_callback_payload(
     security_findings: list[dict[str, Any]] | None = None,
     security_verdict: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    compact_findings, compact_metadata = compact_security_findings(security_findings)
+    log_metadata = {
+        "logs_sent_count": len(logs),
+        "logs_max_lines": MAX_CALLBACK_LOG_LINES,
+    }
     return {
         "job_id": job_id,
         "status": _normalize_status(pipeline_run.status),
@@ -29,21 +149,10 @@ def build_callback_payload(
         "started_at": pipeline_run.started_at,
         "ended_at": pipeline_run.finished_at,
         "logs": logs,
-        "steps": [
-            {
-                "name": step.step_name,
-                "status": step.status,
-                "exit_code": step.exit_code,
-                "summary": step.summary_message,
-                "started_at": step.started_at,
-                "finished_at": step.finished_at,
-                "log_file": step.log_file,
-            }
-            for step in pipeline_run.steps
-        ],
+        "steps": [_serialize_step(step) for step in pipeline_run.steps],
         "security": {
             "summaries": security_summaries or [],
-            "findings": security_findings or [],
+            "findings": compact_findings,
             "verdict": security_verdict,
         },
         "metadata": {
@@ -51,6 +160,10 @@ def build_callback_payload(
             "run_id": pipeline_run.run_id,
             "workflow_name": pipeline_run.workflow_name,
             "workflow_source": pipeline_run.workflow_source,
+            "truncated": {
+                **log_metadata,
+                **compact_metadata,
+            },
         },
     }
 
@@ -164,14 +277,14 @@ def _post_once(
     timeout_sec: int,
 ) -> tuple[bool, str]:
     body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if callback_token:
+        headers["x-callback-token"] = callback_token
     req = request.Request(
         callback_url,
         data=body,
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "x-callback-token": callback_token,
-        },
+        headers=headers,
     )
 
     try:
@@ -206,13 +319,7 @@ def build_step_callback_payload(
         "repo_url": repo_url,
         "branch": branch,
         "step": {
-            "name": step.step_name,
-            "status": step.status,
-            "exit_code": step.exit_code,
-            "summary": step.summary_message,
-            "started_at": step.started_at,
-            "finished_at": step.finished_at,
-            "log_file": step.log_file,
+            **_serialize_step(step),
             "logs": step_log,
             "security": {
                 "summary": step_security_summary,

@@ -53,3 +53,22 @@ def find_missing_env_keys(repo_dir: Path) -> tuple[list[str], list[Path]]:
     provided = set(os.environ.keys())
     missing = sorted(required - provided)
     return missing, source_files
+
+
+def default_public_env_value(key: str) -> str:
+    upper_key = key.upper()
+    if upper_key.startswith("PUBLIC_SHOW_") or upper_key.startswith("PUBLIC_ENABLE_"):
+        return "false"
+    if upper_key.endswith("_URL") or upper_key.endswith("_ENDPOINT"):
+        return "http://localhost"
+    return "local-ci-placeholder"
+
+
+def provide_public_env_defaults(keys: list[str]) -> list[str]:
+    provided: list[str] = []
+    for key in keys:
+        if not key.startswith("PUBLIC_"):
+            continue
+        os.environ.setdefault(key, default_public_env_value(key))
+        provided.append(key)
+    return provided

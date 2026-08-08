@@ -45,6 +45,9 @@ def parse_gitleaks_report(report_file: Path) -> tuple[SecuritySummary, list[Secu
                 line_number=int(item.get("StartLine", item.get("Line", 0)) or 0),
                 message="Hardcoded secret detected (auto-classified as Critical per security policy)",
                 cvss_score=None,
+                cwe="CWE-798",
+                policy_item="hardcoded-secret",
+                column_number=int(item.get("StartColumn", 0) or 0) or None,
             )
         )
 

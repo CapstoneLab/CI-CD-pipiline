@@ -46,6 +46,7 @@ class WorkflowDefinition:
     runtime_type: str
     steps: list[WorkflowStepDefinition]
     source: str
+    selected_items: list[str] | None = None  # CWE ids / item keys; None = all 16
 
 
 def default_workflow_definition() -> WorkflowDefinition:
@@ -89,6 +90,7 @@ def resolve_workflow_definition(
         target_path=repo_dir / DEFAULT_REPO_WORKFLOW_PATH,
         base_dir=base_dir,
         runtime_type=detected_runtime,
+        repo_dir=repo_dir,
     )
     return _reconcile_workflow_runtime(load_workflow_from_yaml(generated_path), repo_dir)
 
@@ -157,7 +159,26 @@ def load_workflow_from_yaml(file_path: Path) -> WorkflowDefinition:
         runtime_type=runtime_type,
         steps=parsed_steps,
         source=str(file_path),
+        selected_items=_parse_selected_items(raw),
     )
+
+
+def _parse_selected_items(raw: dict) -> list[str] | None:
+    """Read selected security items from `selected_items:` or `security.selected_items:`."""
+    candidate = raw.get("selected_items")
+    if candidate is None:
+        security = raw.get("security")
+        if isinstance(security, dict):
+            candidate = security.get("selected_items")
+    if candidate is None:
+        return None
+    if isinstance(candidate, (list, tuple)):
+        items = [str(token).strip() for token in candidate if str(token).strip()]
+        return items or None
+    if isinstance(candidate, str):
+        items = [token.strip() for token in candidate.split(",") if token.strip()]
+        return items or None
+    return None
 
 
 def _parse_step(item: Any, step_index: int, file_path: Path) -> WorkflowStepDefinition:
@@ -243,12 +264,12 @@ def _resolve_explicit_workflow_path(workflow_path: str, repo_dir: Path, base_dir
     if repo_candidate.exists() and repo_candidate.is_file():
         return repo_candidate
 
-    if _looks_like_yaml_file(candidate):
-        return materialize_workflow_template(target_path=repo_candidate, base_dir=base_dir)
-
     base_candidate = base_dir / candidate
     if base_candidate.exists() and base_candidate.is_file():
         return base_candidate
+
+    if _looks_like_yaml_file(candidate):
+        return materialize_workflow_template(target_path=repo_candidate, base_dir=base_dir)
 
     raise ValueError(
         "Workflow file not found. Checked relative paths in repository and engine root: "
@@ -260,17 +281,37 @@ def materialize_workflow_template(
     target_path: Path,
     base_dir: Path,
     runtime_type: str = RUNTIME_TYPE,
+    repo_dir: Path | None = None,
 ) -> Path:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if not target_path.exists():
         target_path.write_text(
-            _load_template_text(base_dir, runtime_type=runtime_type),
+            _load_template_text(base_dir, runtime_type=runtime_type, repo_dir=repo_dir),
             encoding="utf-8",
         )
     return target_path
 
 
-def _load_template_text(base_dir: Path, runtime_type: str = RUNTIME_TYPE) -> str:
+def _load_template_text(
+    base_dir: Path,
+    runtime_type: str = RUNTIME_TYPE,
+    repo_dir: Path | None = None,
+) -> str:
+    if runtime_type == "node" and repo_dir is not None and _looks_like_juice_shop_project(repo_dir):
+        return _juice_shop_template_yaml_text()
+
+    if runtime_type == "node" and repo_dir is not None and _looks_like_dvna_project(repo_dir):
+        return _dvna_docker_template_yaml_text()
+
+    if runtime_type == "java" and repo_dir is not None and _looks_like_webgoat_project(repo_dir):
+        return _webgoat_docker_template_yaml_text()
+
+    if runtime_type == "python" and repo_dir is not None and _looks_like_dvpwa_project(repo_dir):
+        return _dvpwa_docker_template_yaml_text()
+
+    if runtime_type == "python" and repo_dir is not None and _looks_like_python2_project(repo_dir):
+        return _python2_docker_template_yaml_text(repo_dir)
+
     # For non-node runtimes we always emit the built-in template for that runtime
     # instead of falling back to the engine's node-oriented example files.
     if runtime_type == RUNTIME_TYPE:
@@ -280,6 +321,373 @@ def _load_template_text(base_dir: Path, runtime_type: str = RUNTIME_TYPE) -> str
                 return candidate.read_text(encoding="utf-8")
 
     return _default_template_yaml_text(runtime_type=runtime_type)
+
+
+def _looks_like_juice_shop_project(repo_dir: Path) -> bool:
+    package_json = repo_dir / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    name = str(data.get("name") or "").lower()
+    scripts = data.get("scripts")
+    if name == "juice-shop" and isinstance(scripts, dict):
+        return "test:frontend" in scripts and "test:server" in scripts and "test:api" in scripts
+    return False
+
+
+def _juice_shop_template_yaml_text() -> str:
+    return (
+        "name: juice-shop-generated-workflow\n"
+        "runtime:\n"
+        "  type: node\n"
+        "steps:\n"
+        "  - name: install\n"
+        "    uses: install\n"
+        "\n"
+        "  - name: lightweight-security\n"
+        "    uses: lightweight_security_scan\n"
+        "    continue_on_failure: true\n"
+        "    args:\n"
+        "      report_file: gitleaks_report.json\n"
+        "\n"
+        "  - name: test\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        npm run test:frontend\n"
+        "        npm run test:server\n"
+        "\n"
+        "  - name: deep-security\n"
+        "    uses: deep_security_scan\n"
+        "    args:\n"
+        "      report_file: semgrep_report.json\n"
+        "\n"
+        "  - name: build\n"
+        "    uses: build\n"
+        "\n"
+        "  - name: deploy\n"
+        "    uses: deploy\n"
+    )
+
+
+def _looks_like_dvna_project(repo_dir: Path) -> bool:
+    package_json = repo_dir / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    name = str(data.get("name") or "").lower()
+    dependencies = data.get("dependencies")
+    if name != "dvna" or not isinstance(dependencies, dict):
+        return False
+    if "libxmljs" not in dependencies or "node-serialize" not in dependencies:
+        return False
+
+    dockerfile = repo_dir / "Dockerfile"
+    if not dockerfile.exists():
+        return False
+    try:
+        dockerfile_text = dockerfile.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    return "from node:carbon" in dockerfile_text
+
+
+def _looks_like_webgoat_project(repo_dir: Path) -> bool:
+    pom_file = repo_dir / "pom.xml"
+    if not pom_file.exists():
+        return False
+    try:
+        pom_text = pom_file.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    return (
+        "<groupid>org.owasp.webgoat</groupid>" in pom_text
+        and "<artifactid>webgoat</artifactid>" in pom_text
+    )
+
+
+def _webgoat_docker_template_yaml_text() -> str:
+    return (
+        "name: webgoat-docker-generated-workflow\n"
+        "runtime:\n"
+        "  type: java\n"
+        "steps:\n"
+        "  - name: install\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        mkdir -p .localci/m2\n"
+        "        docker run --rm \\\n"
+        "          -v \"$PWD:/repo\" \\\n"
+        "          -v \"$PWD/.localci/m2:/root/.m2\" \\\n"
+        "          -w /repo \\\n"
+        "          eclipse-temurin:25-jdk \\\n"
+        "          bash -lc './mvnw -B -ntp -DskipTests compile'\n"
+        "\n"
+        "  - name: lightweight-security\n"
+        "    uses: lightweight_security_scan\n"
+        "    continue_on_failure: true\n"
+        "    args:\n"
+        "      report_file: gitleaks_report.json\n"
+        "\n"
+        "  - name: test\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        mkdir -p .localci/m2\n"
+        "        docker run --rm \\\n"
+        "          -v \"$PWD:/repo\" \\\n"
+        "          -v \"$PWD/.localci/m2:/root/.m2\" \\\n"
+        "          -w /repo \\\n"
+        "          eclipse-temurin:25-jdk \\\n"
+        "          bash -lc './mvnw -B -ntp test'\n"
+        "\n"
+        "  - name: deep-security\n"
+        "    uses: deep_security_scan\n"
+        "    args:\n"
+        "      report_file: semgrep_report.json\n"
+        "\n"
+        "  - name: build\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        mkdir -p .localci/m2\n"
+        "        docker run --rm \\\n"
+        "          -v \"$PWD:/repo\" \\\n"
+        "          -v \"$PWD/.localci/m2:/root/.m2\" \\\n"
+        "          -w /repo \\\n"
+        "          eclipse-temurin:25-jdk \\\n"
+        "          bash -lc './mvnw -B -ntp -DskipTests package'\n"
+        "\n"
+        "  - name: deploy\n"
+        "    uses: deploy\n"
+    )
+
+
+def _dvna_docker_template_yaml_text() -> str:
+    return (
+        "name: dvna-docker-generated-workflow\n"
+        "runtime:\n"
+        "  type: node\n"
+        "steps:\n"
+        "  - name: install\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker build -t localci-dvna:ci .\n"
+        "\n"
+        "  - name: lightweight-security\n"
+        "    uses: lightweight_security_scan\n"
+        "    continue_on_failure: true\n"
+        "    args:\n"
+        "      report_file: gitleaks_report.json\n"
+        "\n"
+        "  - name: test\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker run --rm localci-dvna:ci node --check /app/server.js\n"
+        "\n"
+        "  - name: deep-security\n"
+        "    uses: deep_security_scan\n"
+        "    args:\n"
+        "      report_file: semgrep_report.json\n"
+        "\n"
+        "  - name: build\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker image inspect localci-dvna:ci >/dev/null\n"
+        "\n"
+        "  - name: deploy\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        echo \"Docker image localci-dvna:ci is ready for deployment\"\n"
+    )
+
+
+def _looks_like_python2_project(repo_dir: Path) -> bool:
+    version_files = [repo_dir / ".python-version", *repo_dir.glob("*/.python-version")]
+    for version_file in version_files:
+        try:
+            version = version_file.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            continue
+        if version.startswith("2.7") or version.startswith("python-2.7"):
+            return True
+
+    dockerfiles = [repo_dir / "Dockerfile", *repo_dir.glob("*/Dockerfile")]
+    for dockerfile in dockerfiles:
+        try:
+            text = dockerfile.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        if "from python:2.7" in text or "from python:2-" in text:
+            return True
+
+    return False
+
+
+def _looks_like_dvpwa_project(repo_dir: Path) -> bool:
+    if not (repo_dir / "Dockerfile.app").exists():
+        return False
+    if not (repo_dir / "requirements.txt").exists():
+        return False
+    if not (repo_dir / "run.py").exists() or not (repo_dir / "sqli").is_dir():
+        return False
+
+    try:
+        readme = (repo_dir / "README.rst").read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        readme = ""
+    if "damn vulnerable python web application" in readme or "dvpwa" in readme:
+        return True
+
+    try:
+        dockerfile = (repo_dir / "Dockerfile.app").read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    return "python:alpine3.8" in dockerfile and "wait-for" in dockerfile
+
+
+def _dvpwa_docker_template_yaml_text() -> str:
+    return (
+        "name: dvpwa-docker-generated-workflow\n"
+        "runtime:\n"
+        "  type: python\n"
+        "steps:\n"
+        "  - name: install\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker build -f Dockerfile.app -t localci-dvpwa-app:ci .\n"
+        "\n"
+        "  - name: lightweight-security\n"
+        "    uses: lightweight_security_scan\n"
+        "    continue_on_failure: true\n"
+        "    args:\n"
+        "      report_file: gitleaks_report.json\n"
+        "\n"
+        "  - name: test\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker run --rm localci-dvpwa-app:ci python -m compileall -q /app\n"
+        "\n"
+        "  - name: deep-security\n"
+        "    uses: deep_security_scan\n"
+        "    args:\n"
+        "      report_file: semgrep_report.json\n"
+        "\n"
+        "  - name: build\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker image inspect localci-dvpwa-app:ci >/dev/null\n"
+        "\n"
+        "  - name: deploy\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        echo \"Docker image localci-dvpwa-app:ci is ready for deployment\"\n"
+    )
+
+
+def _python_project_cwd(repo_dir: Path) -> str:
+    if (repo_dir / "requirements.txt").exists() or (repo_dir / "pyproject.toml").exists():
+        return "."
+    candidates = [
+        child
+        for child in sorted(repo_dir.iterdir())
+        if child.is_dir()
+        and not child.name.startswith(".")
+        and ((child / "requirements.txt").exists() or (child / "pyproject.toml").exists())
+    ]
+    if len(candidates) == 1:
+        return candidates[0].name
+    return "."
+
+
+def _python2_docker_template_yaml_text(repo_dir: Path) -> str:
+    cwd = _python_project_cwd(repo_dir)
+    return (
+        "name: python2-docker-generated-workflow\n"
+        "runtime:\n"
+        "  type: python\n"
+        "steps:\n"
+        "  - name: install\n"
+        "    cwd: " + cwd + "\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        grep -vi '^mysql-python==' requirements.txt > requirements.ci-py27.txt\n"
+        "        docker run --rm -v \"$PWD:/repo\" -w /repo python:2.7-buster bash -lc '\n"
+        "          python -m pip install --upgrade \"pip<21\" \"setuptools<45\" wheel virtualenv\n"
+        "          python -m virtualenv .venv-py27\n"
+        "          .venv-py27/bin/python -m pip install --upgrade \"pip<21\" \"setuptools<45\" wheel\n"
+        "          .venv-py27/bin/python -m pip install -r requirements.ci-py27.txt\n"
+        "        '\n"
+        "\n"
+        "  - name: lightweight-security\n"
+        "    uses: lightweight_security_scan\n"
+        "    continue_on_failure: true\n"
+        "    args:\n"
+        "      report_file: gitleaks_report.json\n"
+        "\n"
+        "  - name: test\n"
+        "    cwd: " + cwd + "\n"
+        "    run:\n"
+        "      - bash\n"
+        "      - -lc\n"
+        "      - |\n"
+        "        docker run --rm -v \"$PWD:/repo\" -w /repo python:2.7-buster bash -lc '\n"
+        "          APP_PORT=5050 .venv-py27/bin/python app.py > /tmp/vulnerable-flask.log 2>&1 &\n"
+        "          pid=$!\n"
+        "          ok=0\n"
+        "          for i in 1 2 3 4 5 6 7 8; do\n"
+        "            sleep 1\n"
+        "            .venv-py27/bin/python -c \"import urllib2; r=urllib2.urlopen(\\\"http://127.0.0.1:5050/\\\", timeout=2); print(r.getcode())\" && ok=1 && break\n"
+        "          done\n"
+        "          cat /tmp/vulnerable-flask.log\n"
+        "          kill $pid 2>/dev/null || true\n"
+        "          test \"$ok\" = 1\n"
+        "        '\n"
+        "\n"
+        "  - name: deep-security\n"
+        "    uses: deep_security_scan\n"
+        "    args:\n"
+        "      report_file: semgrep_report.json\n"
+        "\n"
+        "  - name: build\n"
+        "    uses: build\n"
+        "    cwd: " + cwd + "\n"
+        "\n"
+        "  - name: deploy\n"
+        "    uses: deploy\n"
+        "    cwd: " + cwd + "\n"
+    )
 
 
 def _default_template_yaml_text(runtime_type: str = RUNTIME_TYPE) -> str:

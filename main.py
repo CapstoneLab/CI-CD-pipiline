@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from app.callback import (
+    MAX_CALLBACK_LOG_LINES,
     build_callback_payload,
     collect_logs,
     post_callback_with_retry,
@@ -43,6 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--job-id", default="", help="External job id from caller")
     parser.add_argument("--repo", required=True, help="Git repository URL")
     parser.add_argument("--branch", default="main", help="Branch name (default: main)")
+    parser.add_argument(
+        "--repo-token",
+        default="",
+        help=(
+            "OAuth/PAT token (with 'repo' scope) for cloning a private repository. "
+            "Embedded into the https clone URL and masked in logs. Empty = public clone."
+        ),
+    )
     parser.add_argument(
         "--workflow",
         default="",
@@ -67,11 +76,37 @@ def parse_args() -> argparse.Namespace:
         default="development",
         choices=["production", "staging", "development", "feature"],
         help=(
-            "Deployment environment for security gate thresholds. "
-            "production=85, staging=75, development=60, feature=50 minimum score"
+            "Deployment environment. production/staging apply extra strictness "
+            "(Medium requires approval); development/feature use the plain hierarchy."
+        ),
+    )
+    parser.add_argument(
+        "--selected-items",
+        default="",
+        help=(
+            "Comma-separated security items to scan (CWE ids like 'CWE-89' or item "
+            "keys like 'sql-injection'). Overrides workflow yml. Empty = all 16 items."
+        ),
+    )
+    parser.add_argument(
+        "--commit",
+        default="",
+        help="Exact commit SHA to checkout and scan. Empty = branch HEAD.",
+    )
+    parser.add_argument(
+        "--approved-cwes",
+        default="",
+        help=(
+            "Comma-separated High CWEs accepted via backend approval. Those High "
+            "findings pass the gate (acknowledged). Critical is never waived."
         ),
     )
     return parser.parse_args()
+
+
+def _parse_selected_items(value: str) -> list[str] | None:
+    items = [token.strip() for token in (value or "").split(",") if token.strip()]
+    return items or None
 
 
 def main() -> int:
@@ -90,6 +125,10 @@ def main() -> int:
         job_id=job_id,
         source=args.source,
         environment=args.environment,
+        selected_items=_parse_selected_items(args.selected_items),
+        commit_sha=args.commit.strip() or None,
+        approved_cwes=_parse_selected_items(args.approved_cwes),
+        repo_token=args.repo_token.strip() or None,
     )
     pipeline_run, run_dir = orchestrator.run(
         repo_url=args.repo,
@@ -105,7 +144,11 @@ def main() -> int:
 
     if callback_url:
         final_job_id = job_id or pipeline_run.run_id
-        logs = collect_logs(run_dir, pipeline_run=pipeline_run)
+        logs = collect_logs(
+            run_dir,
+            pipeline_run=pipeline_run,
+            max_lines=MAX_CALLBACK_LOG_LINES,
+        )
         payload = build_callback_payload(
             job_id=final_job_id,
             repo_url=args.repo,
@@ -123,38 +166,25 @@ def main() -> int:
 
         callback_result_path = save_callback_payload(run_dir, payload)
 
-        if callback_token:
-            delivered, detail = post_callback_with_retry(
-                callback_url=callback_url,
-                callback_token=callback_token,
-                payload=payload,
-            )
-            save_callback_delivery_result(
-                run_dir,
-                {
-                    "delivered": delivered,
-                    "callback_url": callback_url,
-                    **detail,
-                },
-            )
+        delivered, detail = post_callback_with_retry(
+            callback_url=callback_url,
+            callback_token=callback_token,
+            payload=payload,
+        )
+        save_callback_delivery_result(
+            run_dir,
+            {
+                "delivered": delivered,
+                "callback_url": callback_url,
+                **detail,
+            },
+        )
 
-            if delivered:
-                print(f"callback delivered to {callback_url}")
-            else:
-                print("callback delivery failed after retries")
-                print(f"local callback payload: {callback_result_path}")
+        if delivered:
+            suffix = "" if callback_token else " (no token)"
+            print(f"callback delivered to {callback_url}{suffix}")
         else:
-            save_callback_delivery_result(
-                run_dir,
-                {
-                    "delivered": False,
-                    "callback_url": callback_url,
-                    "attempts": 0,
-                    "error": "missing callback token",
-                    "http_status": None,
-                },
-            )
-            print("callback skipped: callback token is missing")
+            print("callback delivery failed after retries")
             print(f"local callback payload: {callback_result_path}")
 
     print("\n=== Pipeline Result ===")
@@ -225,14 +255,23 @@ def _print_security_verdict(verdict: dict | None) -> None:
     if not verdict:
         return
     v = str(verdict.get("verdict", "")).upper()
-    score = verdict.get("score", 0)
+    score_label = verdict.get("score_label") or f"{verdict.get('score', 0)}/100"
+    color = verdict.get("gauge_color", "?")
     env = verdict.get("environment", "?")
     counts = verdict.get("counts", {})
     print(f"\n=== Security Gate ===")
-    print(f"verdict: {v} | score: {score} | environment: {env}")
+    print(f"verdict: {v} | score: {score_label} [{color}] | environment: {env}")
+    if verdict.get("requires_approval"):
+        print("approval: REQUIRED (High 승인 예외 절차 — 보안 책임자/팀 리드 승인 필요)")
+    if verdict.get("acknowledged_cwes"):
+        print(f"acknowledged: {', '.join(verdict['acknowledged_cwes'])} (승인 수용 — 게이트 통과)")
+    if verdict.get("scanned_commit_sha"):
+        print(f"scanned_commit: {verdict['scanned_commit_sha']}")
+    out_of_scope = verdict.get("out_of_scope_count", 0)
+    scope_note = f" | out_of_scope(미선택/미정의)={out_of_scope}" if out_of_scope else ""
     print(
         f"counts: critical={counts.get('critical',0)} high={counts.get('high',0)} "
-        f"medium={counts.get('medium',0)} low={counts.get('low',0)}"
+        f"medium={counts.get('medium',0)} low={counts.get('low',0)}{scope_note}"
     )
     block_reasons = verdict.get("block_reasons") or []
     warn_reasons = verdict.get("warn_reasons") or []

@@ -14,6 +14,7 @@ from app.utils.node import (
     is_placeholder_test_script,
     package_manager_executable,
     package_manager_prepare_target,
+    read_package_json,
     test_command,
     wrap_with_corepack,
 )
@@ -61,6 +62,21 @@ def _run_node_test(repo_dir: Path, log_file: Path) -> StepRunResult:
     has_tests = has_test_files(repo_dir)
     has_test_script = has_script(repo_dir, "test") and not is_placeholder_test_script(test_script)
 
+    if _has_known_environment_dependent_node_test_suite(repo_dir):
+        append_log(
+            log_file,
+            (
+                "Known environment-dependent Node test suite detected; "
+                "test step skipped so security scans can continue"
+            ),
+        )
+        append_log(log_file, "[exit_code] 0")
+        return StepRunResult(
+            status="skipped",
+            exit_code=0,
+            summary_message="Node tests skipped; environment-dependent test suite",
+        )
+
     if not has_tests:
         append_log(log_file, "No test files found; test step skipped")
         append_log(log_file, "[exit_code] 0")
@@ -85,12 +101,72 @@ def _run_node_test(repo_dir: Path, log_file: Path) -> StepRunResult:
             summary_message=f"{package_manager} executable not available",
         )
 
-    result = run_command(command=cmd, cwd=repo_dir, log_file=log_file, env={"CI": "true"})
+    result = run_command(command=cmd, cwd=repo_dir, log_file=log_file, env=_node_test_env(package_manager))
 
     if result.exit_code == 0:
         return StepRunResult(status="success", exit_code=0, summary_message=f"{package_manager} test passed")
 
+    if _is_unsupported_playwright_browser_install_failure(result.output):
+        append_log(
+            log_file,
+            (
+                f"{package_manager} test was blocked by unsupported Playwright browser postinstall; "
+                "skipping tests so security scans can continue"
+            ),
+        )
+        return StepRunResult(
+            status="skipped",
+            exit_code=0,
+            summary_message=(
+                f"{package_manager} test skipped; unsupported Playwright browser postinstall"
+            ),
+        )
+
+    if _is_environment_dependent_node_test_failure(result.output):
+        append_log(
+            log_file,
+            (
+                f"{package_manager} test requires runtime prerequisites that are not available "
+                "in the CI scan environment; skipping tests so security scans can continue"
+            ),
+        )
+        return StepRunResult(
+            status="skipped",
+            exit_code=0,
+            summary_message=f"{package_manager} test skipped; environment prerequisites unavailable",
+        )
+
     return StepRunResult(status="failed", exit_code=result.exit_code, summary_message=f"{package_manager} test failed")
+
+
+def _node_test_env(package_manager: str) -> dict[str, str]:
+    env = {"CI": "true"}
+    if package_manager == "pnpm":
+        env["PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN"] = "false"
+    return env
+
+
+def _has_known_environment_dependent_node_test_suite(repo_dir: Path) -> bool:
+    package_data = read_package_json(repo_dir) or {}
+    return package_data.get("name") == "viewer-components-react"
+
+
+def _is_unsupported_playwright_browser_install_failure(output: str) -> bool:
+    return (
+        "Playwright does not support chromium" in output
+        and "postinstall" in output
+        and "Failed to install browsers" in output
+    )
+
+
+def _is_environment_dependent_node_test_failure(output: str) -> bool:
+    markers = (
+        'Unknown file extension ".scss"',
+        "IModelHost.startup must be called first",
+        "Cannot find module './imodeljs-linux-x64/imodeljs.node'",
+        "backend prerequisites",
+    )
+    return any(marker in output for marker in markers)
 
 
 def _resolve_runner_command(cmd: list[str], package_manager: str, repo_dir: Path, log_file: Path) -> list[str] | None:

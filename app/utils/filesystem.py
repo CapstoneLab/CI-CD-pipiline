@@ -1,22 +1,39 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from app.constants import RUNS_DIR_NAME, WORKSPACE_DIR_NAME
+
+KST = timezone(timedelta(hours=9))
 
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def data_root(base_dir: Path) -> Path:
+    """Return the persistent run-data root.
+
+    Containers set ``CICD_ENGINE_DATA_DIR`` to a host path mounted at the
+    exact same absolute path. Keeping the path identical on both sides lets
+    child ``docker run -v`` commands use workspace paths without translating
+    container paths back to host paths.
+    """
+    configured = os.environ.get("CICD_ENGINE_DATA_DIR", "").strip()
+    if not configured:
+        return base_dir
+    return Path(configured).expanduser().resolve()
+
+
 def make_run_id(base_dir: Path) -> str:
-    runs_dir = base_dir / RUNS_DIR_NAME
+    runs_dir = data_root(base_dir) / RUNS_DIR_NAME
     ensure_dir(runs_dir)
 
-    date_prefix = datetime.now().strftime("%Y%m%d")
+    date_prefix = datetime.now(KST).strftime("%Y%m%d")
     run_prefix = f"run-{date_prefix}-"
 
     max_index = 0
@@ -31,8 +48,9 @@ def make_run_id(base_dir: Path) -> str:
 
 
 def prepare_run_paths(base_dir: Path, run_id: str) -> dict[str, Path]:
-    runs_dir = base_dir / RUNS_DIR_NAME
-    workspace_dir = base_dir / WORKSPACE_DIR_NAME
+    root_dir = data_root(base_dir)
+    runs_dir = root_dir / RUNS_DIR_NAME
+    workspace_dir = root_dir / WORKSPACE_DIR_NAME
 
     run_dir = runs_dir / run_id
     logs_dir = run_dir / "logs"

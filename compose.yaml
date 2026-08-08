@@ -1,0 +1,68 @@
+name: capstone-cicd
+
+services:
+  backend:
+    profiles: ["managed-backend"]
+    image: ${BACKEND_IMAGE:-yakdoll/capstone-back:125291b89076d4db1f4970a9c84aa21da60cbdac}
+    container_name: ${BACKEND_CONTAINER_NAME:-capstone-back}
+    env_file:
+      - ${BACKEND_ENV_FILE:-.env.backend.example}
+    ports:
+      - "${BACKEND_BIND_ADDRESS:-0.0.0.0}:${BACKEND_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      internal:
+        aliases: [backend]
+
+  cicd-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${CICD_ENGINE_IMAGE:-ghcr.io/capstonelab/cicd-engine:local}
+    container_name: ${CICD_ENGINE_CONTAINER_NAME:-capstone-cicd-engine}
+    environment:
+      BACKEND_BASE_URL: http://backend:8000
+      ENGINE_SHARED_TOKEN: ${ENGINE_SHARED_TOKEN:?Set ENGINE_SHARED_TOKEN in .env}
+      ENGINE_ID: ${ENGINE_ID:-ubuntu-engine-01}
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-15}
+      POLL_FETCH_LIMIT: ${POLL_FETCH_LIMIT:-5}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CICD_ENGINE_DATA_DIR: ${ENGINE_DATA_ROOT:?Run docker/compose-up.sh or set ENGINE_DATA_ROOT}
+    volumes:
+      - type: bind
+        source: ${ENGINE_DATA_ROOT}
+        target: ${ENGINE_DATA_ROOT}
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://backend:8000/health', timeout=3).read()
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [internal]
+
+networks:
+  internal:
+    name: ${CAPSTONE_NETWORK_NAME:-capstone-internal}
+    external: true
