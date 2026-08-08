@@ -72,6 +72,10 @@ def _run_node_install(repo_dir: Path, log_file: Path) -> StepRunResult:
     if not is_supported:
         return StepRunResult(status="failed", exit_code=1, summary_message=reason)
 
+    rush_result = _run_rush_install_if_applicable(repo_dir=repo_dir, log_file=log_file)
+    if rush_result is not None:
+        return rush_result
+
     stripped_node_pkgs = strip_engine_managed_dependencies(repo_dir)
     if stripped_node_pkgs:
         append_log(
@@ -92,11 +96,13 @@ def _run_node_install(repo_dir: Path, log_file: Path) -> StepRunResult:
         frozen_install_cmd = install_command(package_manager, frozen_lock=True)
         if resolution.command_transform == "corepack":
             frozen_install_cmd = wrap_with_corepack(frozen_install_cmd, package_manager)
+        frozen_install_cmd = _with_pnpm_ci_store(package_manager, frozen_install_cmd)
 
         ci_result = run_command(
             command=frozen_install_cmd,
             cwd=repo_dir,
             log_file=log_file,
+            env=_node_install_env(package_manager),
         )
 
         if ci_result.exit_code == 0:
@@ -109,11 +115,13 @@ def _run_node_install(repo_dir: Path, log_file: Path) -> StepRunResult:
         install_cmd = install_command(package_manager, frozen_lock=False)
         if resolution.command_transform == "corepack":
             install_cmd = wrap_with_corepack(install_cmd, package_manager)
+        install_cmd = _with_pnpm_ci_store(package_manager, install_cmd)
 
         install_result = run_command(
             command=install_cmd,
             cwd=repo_dir,
             log_file=log_file,
+            env=_node_install_env(package_manager),
         )
         if install_result.exit_code == 0:
             return StepRunResult(
@@ -122,9 +130,45 @@ def _run_node_install(repo_dir: Path, log_file: Path) -> StepRunResult:
                 summary_message=f"dependencies installed ({package_manager} install fallback)",
             )
 
+        trusted_build_result = _retry_pnpm_install_allowing_build_scripts(
+            package_manager=package_manager,
+            command=install_cmd,
+            repo_dir=repo_dir,
+            log_file=log_file,
+            previous_output=install_result.output,
+        )
+        if trusted_build_result and trusted_build_result.exit_code == 0:
+            return StepRunResult(
+                status="success",
+                exit_code=0,
+                summary_message=(
+                    "dependencies installed (pnpm install fallback with approved dependency builds)"
+                ),
+            )
+
+        nonblocking_install_output = install_result.output
+        if trusted_build_result:
+            nonblocking_install_output += "\n" + trusted_build_result.output
+        if _is_unsupported_playwright_browser_install_failure(nonblocking_install_output):
+            append_log(
+                log_file,
+                (
+                    f"{package_manager} install reached an unsupported Playwright browser postinstall; "
+                    "continuing because source security scans do not require the browser binary"
+                ),
+            )
+            return StepRunResult(
+                status="success",
+                exit_code=0,
+                summary_message=(
+                    f"dependencies installed ({package_manager} install; "
+                    "ignored unsupported Playwright browser postinstall)"
+                ),
+            )
+
         return StepRunResult(
             status="failed",
-            exit_code=install_result.exit_code,
+            exit_code=(trusted_build_result.exit_code if trusted_build_result else install_result.exit_code),
             summary_message=(
                 f"dependency install failed ({package_manager} lock install and fallback install both failed)"
             ),
@@ -133,11 +177,13 @@ def _run_node_install(repo_dir: Path, log_file: Path) -> StepRunResult:
     install_cmd = install_command(package_manager, frozen_lock=False)
     if resolution.command_transform == "corepack":
         install_cmd = wrap_with_corepack(install_cmd, package_manager)
+    install_cmd = _with_pnpm_ci_store(package_manager, install_cmd)
 
     result = run_command(
         command=install_cmd,
         cwd=repo_dir,
         log_file=log_file,
+        env=_node_install_env(package_manager),
     )
 
     if result.exit_code == 0:
@@ -147,11 +193,166 @@ def _run_node_install(repo_dir: Path, log_file: Path) -> StepRunResult:
             summary_message=f"dependencies installed ({package_manager} install)",
         )
 
+    trusted_build_result = _retry_pnpm_install_allowing_build_scripts(
+        package_manager=package_manager,
+        command=install_cmd,
+        repo_dir=repo_dir,
+        log_file=log_file,
+        previous_output=result.output,
+    )
+    if trusted_build_result and trusted_build_result.exit_code == 0:
+        return StepRunResult(
+            status="success",
+            exit_code=0,
+            summary_message="dependencies installed (pnpm install with approved dependency builds)",
+        )
+
+    nonblocking_install_output = result.output
+    if trusted_build_result:
+        nonblocking_install_output += "\n" + trusted_build_result.output
+    if _is_unsupported_playwright_browser_install_failure(nonblocking_install_output):
+        append_log(
+            log_file,
+            (
+                f"{package_manager} install reached an unsupported Playwright browser postinstall; "
+                "continuing because source security scans do not require the browser binary"
+            ),
+        )
+        return StepRunResult(
+            status="success",
+            exit_code=0,
+            summary_message=(
+                f"dependencies installed ({package_manager} install; "
+                "ignored unsupported Playwright browser postinstall)"
+            ),
+        )
+
+    return StepRunResult(
+        status="failed",
+        exit_code=(trusted_build_result.exit_code if trusted_build_result else result.exit_code),
+        summary_message="dependency install failed",
+    )
+
+
+def _run_rush_install_if_applicable(repo_dir: Path, log_file: Path) -> StepRunResult | None:
+    if not (repo_dir / "rush.json").exists():
+        return None
+
+    install_run_rush = repo_dir / "common" / "scripts" / "install-run-rush.js"
+    if not install_run_rush.exists():
+        return StepRunResult(
+            status="failed",
+            exit_code=127,
+            summary_message="rush.json detected but common/scripts/install-run-rush.js is missing",
+        )
+
+    if not is_command_available("node"):
+        return StepRunResult(
+            status="failed",
+            exit_code=127,
+            summary_message="rush install requires node, but node was not found",
+        )
+
+    append_log(log_file, "Rush monorepo detected; running rush install")
+    rush_global_folder = Path("/tmp") / "cicd-engine-rush"
+    rush_global_folder.mkdir(parents=True, exist_ok=True)
+    result = run_command(
+        command=["node", str(install_run_rush.relative_to(repo_dir)), "install", "--bypass-policy"],
+        cwd=repo_dir,
+        log_file=log_file,
+        env={
+            "CI": "true",
+            "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+            "RUSH_GLOBAL_FOLDER": str(rush_global_folder),
+        },
+    )
+    if result.exit_code == 0:
+        return StepRunResult(
+            status="success",
+            exit_code=0,
+            summary_message="dependencies installed (rush install)",
+        )
+
+    if _is_unsupported_playwright_browser_install_failure(result.output):
+        append_log(
+            log_file,
+            (
+                "Rush install reached an unsupported Playwright browser postinstall; "
+                "continuing because source security scans do not require the browser binary"
+            ),
+        )
+        return StepRunResult(
+            status="success",
+            exit_code=0,
+            summary_message=(
+                "dependencies installed (rush install; ignored unsupported Playwright browser postinstall)"
+            ),
+        )
+
     return StepRunResult(
         status="failed",
         exit_code=result.exit_code,
-        summary_message="dependency install failed",
+        summary_message="dependency install failed (rush install)",
     )
+
+
+def _is_unsupported_playwright_browser_install_failure(output: str) -> bool:
+    return (
+        "Playwright does not support chromium" in output
+        and "postinstall" in output
+        and "Failed to install browsers" in output
+    )
+
+
+def _retry_pnpm_install_allowing_build_scripts(
+    package_manager: str,
+    command: list[str],
+    repo_dir: Path,
+    log_file: Path,
+    previous_output: str,
+):
+    if package_manager != "pnpm":
+        return None
+    if "ERR_PNPM_IGNORED_BUILDS" not in previous_output:
+        return None
+
+    append_log(
+        log_file,
+        (
+            "pnpm ignored dependency build scripts; retrying once with "
+            "dangerouslyAllowAllBuilds=true for CI install"
+        ),
+    )
+    trusted_command = [*command, "--config.dangerouslyAllowAllBuilds=true"]
+    return run_command(
+        command=trusted_command,
+        cwd=repo_dir,
+        log_file=log_file,
+        env={
+            **_node_install_env(package_manager),
+            "PNPM_CONFIG_DANGEROUSLY_ALLOW_ALL_BUILDS": "true",
+        },
+    )
+
+
+def _with_pnpm_ci_store(package_manager: str, command: list[str]) -> list[str]:
+    if package_manager != "pnpm":
+        return command
+    store_dir = Path("/tmp") / "cicd-engine-pnpm-store"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        *command,
+        "--store-dir",
+        str(store_dir),
+        "--config.confirmModulesPurge=false",
+    ]
+
+
+def _node_install_env(package_manager: str) -> dict[str, str]:
+    env = {"CI": "true"}
+    if package_manager == "pnpm":
+        env["PNPM_CONFIG_CONFIRM_MODULES_PURGE"] = "false"
+    return env
 
 
 def _resolve_package_manager_runner(repo_dir: Path, package_manager: str, log_file: Path) -> _PackageManagerResolution:

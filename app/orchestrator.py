@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from app.callback import build_step_callback_payload, collect_logs, post_step_callback
 from app.constants import RUNTIME_TYPE
 from app.models import PipelineRun, PipelineStep, SecurityFinding, SecuritySummary, StepRunResult, now_iso
-from app.security_policy import SecurityVerdict, evaluate as evaluate_security_policy, format_summary
-from app.utils.env_requirements import find_missing_env_keys
+from app.security_policy import (
+    SecurityVerdict,
+    evaluate as evaluate_security_policy,
+    format_summary,
+    is_blocking,
+)
+from app.utils.env_requirements import find_missing_env_keys, provide_public_env_defaults
 from app.steps.build import run_build
 from app.steps.clone import run_clone
 from app.steps.deep_security import run_deep_security_scan
@@ -21,6 +27,22 @@ from app.utils.shell import run_command
 from app.workflow import WorkflowStepDefinition, resolve_workflow_definition
 
 
+def _resolve_head_sha(repo_dir: Path) -> str | None:
+    """Actual commit SHA scanned (HEAD after clone/checkout). None if unknown."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = proc.stdout.strip()
+    return sha or None
+
+
 class LocalOrchestrator:
     def __init__(
         self,
@@ -30,6 +52,10 @@ class LocalOrchestrator:
         job_id: str = "",
         source: str = "capstone",
         environment: str = "development",
+        selected_items: list[str] | None = None,
+        commit_sha: str | None = None,
+        approved_cwes: list[str] | None = None,
+        repo_token: str | None = None,
     ) -> None:
         self.base_dir = base_dir
         self._current_runtime_type: str = RUNTIME_TYPE
@@ -38,6 +64,17 @@ class LocalOrchestrator:
         self._job_id = job_id
         self._source = source
         self._environment = environment
+        # selected_items from the caller (backend job payload / CLI). Takes
+        # precedence over any selected_items declared in the workflow yml.
+        self._selected_items_override = selected_items
+        self._effective_selected_items: list[str] | None = selected_items
+        # requested commit to scan; actual scanned commit captured after clone
+        self._commit_sha = (commit_sha or "").strip() or None
+        self._scanned_commit_sha: str | None = None
+        # High CWEs accepted via backend approval -> waived at the gate
+        self._approved_cwes = approved_cwes or []
+        # OAuth/PAT token for cloning private repos; masked in logs by run_command
+        self._repo_token = (repo_token or "").strip() or None
         self._security_verdict: SecurityVerdict | None = None
 
     def run(self, repo_url: str, branch: str | None, workflow_path: str | None = None) -> tuple[PipelineRun, Path]:
@@ -139,6 +176,13 @@ class LocalOrchestrator:
         pipeline_run.workflow_name = workflow.name
         pipeline_run.workflow_source = workflow.source
         self._current_runtime_type = workflow.runtime_type
+
+        # selected items precedence: caller override (payload/CLI) > workflow yml > all 16
+        self._effective_selected_items = (
+            self._selected_items_override
+            if self._selected_items_override
+            else workflow.selected_items
+        )
 
         active_step_definitions = [
             sd for sd in workflow.steps if not self._should_skip_step_for_source(sd)
@@ -292,7 +336,7 @@ class LocalOrchestrator:
         branch: str | None,
         result: StepRunResult | None = None,
     ) -> None:
-        if not self._callback_url or not self._callback_token:
+        if not self._callback_url:
             return
 
         step_log: list[str] = []
@@ -362,7 +406,17 @@ class LocalOrchestrator:
         log_file = logs_dir / f"{step_name}.log"
 
         if step_name == "clone":
-            return run_clone(repo_url=repo_url, branch=branch, repo_dir=repo_dir, log_file=log_file)
+            clone_result = run_clone(
+                repo_url=repo_url,
+                branch=branch,
+                repo_dir=repo_dir,
+                log_file=log_file,
+                commit_sha=self._commit_sha,
+                repo_token=self._repo_token,
+            )
+            if clone_result.status == "success":
+                self._scanned_commit_sha = _resolve_head_sha(repo_dir)
+            return clone_result
 
         if not step_definition:
             return StepRunResult(
@@ -395,6 +449,99 @@ class LocalOrchestrator:
             summary_message=f"Unsupported step kind: {step_definition.kind}",
         )
 
+    def _resolve_project_dir(
+        self,
+        repo_dir: Path,
+        step_definition: WorkflowStepDefinition,
+    ) -> tuple[Path, StepRunResult | None]:
+        """Resolve the project directory for a lifecycle builtin from step.cwd.
+
+        Defaults to the repo root. Validates the resolved path stays inside the
+        repo and exists. Returns (project_dir, error_result|None)."""
+        cwd = (step_definition.cwd or ".").strip() or "."
+        if cwd != ".":
+            # Explicit cwd from the workflow: validate and respect it as-is.
+            repo_root = repo_dir.resolve()
+            project_dir = (repo_dir / cwd).resolve()
+            if not project_dir.is_relative_to(repo_root):
+                return repo_dir, StepRunResult(
+                    status="failed",
+                    exit_code=1,
+                    summary_message=f"Step '{step_definition.name}' cwd escapes repository root: {cwd}",
+                )
+            if not project_dir.is_dir():
+                return repo_dir, StepRunResult(
+                    status="failed",
+                    exit_code=1,
+                    summary_message=f"Step '{step_definition.name}' cwd not found: {cwd}",
+                )
+            return project_dir, None
+
+        # No explicit cwd: auto-descend for monorepos when the root has no
+        # project for this runtime (e.g. package.json lives in web-server/).
+        detected, ambiguous = self._autodetect_project_subdir(repo_dir, self._current_runtime_type)
+        if ambiguous:
+            return repo_dir, StepRunResult(
+                status="failed",
+                exit_code=1,
+                summary_message=(
+                    f"Step '{step_definition.name}': monorepo with multiple candidate "
+                    f"projects ({', '.join(ambiguous)}). Set 'cwd' in the workflow to pick one."
+                ),
+            )
+        return detected, None
+
+    def _autodetect_project_subdir(
+        self,
+        repo_dir: Path,
+        runtime_type: str,
+    ) -> tuple[Path, list[str] | None]:
+        """Return (project_dir, ambiguous_candidates).
+
+        If the repo root already has a project marker for the runtime, returns
+        the root. Otherwise scans immediate subdirectories: exactly one match →
+        that dir; multiple → prefer a backend-like node app (has a server entry,
+        not a frontend), else report the candidates as ambiguous.
+        """
+        markers = {
+            "node": ["package.json"],
+            "python": ["requirements.txt", "pyproject.toml", "setup.py"],
+            "java": ["pom.xml", "build.gradle", "build.gradle.kts"],
+        }.get(runtime_type, ["package.json"])
+
+        def has_marker(d: Path) -> bool:
+            return any((d / m).exists() for m in markers)
+
+        if has_marker(repo_dir):
+            return repo_dir, None
+
+        skip = {"node_modules", ".git", "dist", "build", "out", "target", ".venv", "__pycache__"}
+        candidates = [
+            d for d in sorted(repo_dir.iterdir())
+            if d.is_dir() and not d.name.startswith(".") and d.name not in skip and has_marker(d)
+        ]
+        if not candidates:
+            return repo_dir, None
+        if len(candidates) == 1:
+            return candidates[0], None
+
+        # Multiple candidates: prefer a node backend (has a server entry file
+        # and is not a frontend SPA). Disambiguates frontend/ vs web-server/.
+        if runtime_type == "node":
+            backend_like = [d for d in candidates if self._looks_like_node_backend(d)]
+            if len(backend_like) == 1:
+                return backend_like[0], None
+
+        return repo_dir, [d.name for d in candidates]
+
+    @staticmethod
+    def _looks_like_node_backend(d: Path) -> bool:
+        server_entries = ("server.js", "app.js", "index.js", "main.js", "server.ts", "app.ts")
+        has_server = any((d / f).exists() for f in server_entries)
+        frontend_markers = ("vite.config.js", "vite.config.ts", "angular.json", "index.html")
+        is_frontend = any((d / f).exists() for f in frontend_markers)
+        return has_server and not is_frontend
+
     def _execute_builtin_step(
         self,
         step_definition: WorkflowStepDefinition,
@@ -407,8 +554,18 @@ class LocalOrchestrator:
     ) -> StepRunResult:
         uses_name = step_definition.uses
 
+        # Project-lifecycle builtins (install/test/build/deploy) honor the
+        # step's `cwd`, and auto-descend into a monorepo subdirectory when the
+        # root has no project for this runtime. Security scans keep scanning
+        # the whole repo, so they never trigger cwd resolution.
+        project_dir = repo_dir
+        if uses_name in {"install", "test", "build", "deploy"}:
+            project_dir, cwd_error = self._resolve_project_dir(repo_dir, step_definition)
+            if cwd_error is not None:
+                return cwd_error
+
         if uses_name == "install":
-            return run_install(repo_dir=repo_dir, log_file=log_file, runtime_type=runtime_type)
+            return run_install(repo_dir=project_dir, log_file=log_file, runtime_type=runtime_type)
 
         if uses_name == "lightweight_security_scan":
             report_name = _safe_report_file_name(step_definition.args.get("report_file"), "gitleaks_report.json")
@@ -419,20 +576,21 @@ class LocalOrchestrator:
             )
 
         if uses_name == "test":
-            return run_test(repo_dir=repo_dir, log_file=log_file, runtime_type=runtime_type)
+            return run_test(repo_dir=project_dir, log_file=log_file, runtime_type=runtime_type)
 
         if uses_name == "deep_security_scan":
             report_name = _safe_report_file_name(step_definition.args.get("report_file"), "semgrep_report.json")
+            ai_recommendation = bool(step_definition.args.get("ai_recommendation", False))
             return run_deep_security_scan(
                 repo_dir=repo_dir,
                 log_file=log_file,
                 report_file=run_dir / report_name,
-                ai_recommendation=True,
+                ai_recommendation=ai_recommendation,
             )
 
         if uses_name == "build":
             return run_build(
-                repo_dir=repo_dir,
+                repo_dir=project_dir,
                 log_file=log_file,
                 artifacts_dir=run_dir / "artifacts",
                 runtime_type=runtime_type,
@@ -440,7 +598,7 @@ class LocalOrchestrator:
 
         if uses_name == "deploy":
             return run_deploy(
-                repo_dir=repo_dir,
+                repo_dir=project_dir,
                 run_dir=run_dir,
                 log_file=log_file,
                 repo_url=repo_url,
@@ -514,7 +672,13 @@ class LocalOrchestrator:
         repo_url: str,
         branch: str | None,
     ) -> StepRunResult:
-        verdict = evaluate_security_policy(findings, environment=self._environment)
+        verdict = evaluate_security_policy(
+            findings,
+            selected_items=self._effective_selected_items,
+            environment=self._environment,
+            approved_cwes=self._approved_cwes,
+            scanned_commit_sha=self._scanned_commit_sha,
+        )
         self._security_verdict = verdict
 
         gate_step = PipelineStep(step_name="security_gate")
@@ -523,16 +687,23 @@ class LocalOrchestrator:
         gate_step.started_at = now_iso()
         log_path = self.base_dir / gate_step.log_file
         append_log(log_path, f"$ security_gate (environment={verdict.environment})")
-        append_log(log_path, f"[counts] {verdict.counts}")
-        append_log(log_path, f"[score] {verdict.score}")
-        append_log(log_path, f"[thresholds] {verdict.thresholds}")
+        if verdict.scanned_commit_sha:
+            append_log(log_path, f"[commit] scanned {verdict.scanned_commit_sha}")
+        if verdict.acknowledged_cwes:
+            append_log(log_path, f"[acknowledged] {', '.join(verdict.acknowledged_cwes)}")
+        append_log(log_path, f"[scope] {verdict.score_label}")
+        append_log(log_path, f"[counts] {verdict.counts} out_of_scope={verdict.out_of_scope_count}")
+        append_log(log_path, f"[score] {verdict.score} ({verdict.gauge_color})")
+        append_log(log_path, f"[breakdown] {verdict.score_breakdown}")
+        if verdict.requires_approval:
+            append_log(log_path, "[approval] High/엄격정책 — 승인 예외 절차 필요")
         for reason in verdict.block_reasons:
             append_log(log_path, f"[BLOCK] {reason}")
         for reason in verdict.warn_reasons:
             append_log(log_path, f"[WARN] {reason}")
         append_log(log_path, f"[verdict] {verdict.verdict.upper()}")
 
-        if verdict.verdict == "block":
+        if is_blocking(verdict):
             result = StepRunResult(
                 status="failed",
                 exit_code=1,
@@ -569,13 +740,29 @@ class LocalOrchestrator:
         log_file = logs_dir / "env_check.log"
         rel_sources = [str(p.relative_to(repo_dir)) for p in source_files]
         append_log(log_file, f"$ env_check (sources: {', '.join(rel_sources)})")
+
+        auto_provided = provide_public_env_defaults(missing)
+        if auto_provided:
+            append_log(
+                log_file,
+                (
+                    "[env_check] auto-provided public frontend env defaults: "
+                    f"{', '.join(auto_provided)}"
+                ),
+            )
+            auto_provided_set = set(auto_provided)
+            missing = [key for key in missing if key not in auto_provided_set]
+
         if not missing:
             append_log(log_file, "[env_check] all required env keys provided")
             append_log(log_file, "[exit_code] 0")
+            detail = f"Required env keys satisfied (from {', '.join(rel_sources)})"
+            if auto_provided:
+                detail += f"; public defaults injected for {', '.join(auto_provided)}"
             return StepRunResult(
                 status="success",
                 exit_code=0,
-                summary_message=f"Required env keys satisfied (from {', '.join(rel_sources)})",
+                summary_message=detail,
             )
         append_log(log_file, f"[env_check] MISSING env keys: {', '.join(missing)}")
         append_log(log_file, "[env_check] Provide these via the backend env input prompt and re-run.")

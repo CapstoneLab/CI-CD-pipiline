@@ -28,3 +28,7 @@ Thumbs.db
 # Secrets
 .env
 .env.local
+.env.backend
+
+# Docker Compose runtime data
+.docker-data/

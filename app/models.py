@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+KST = timezone(timedelta(hours=9))
 
 
 def now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(KST).replace(microsecond=0).isoformat()
 
 
 @dataclass
@@ -22,6 +24,11 @@ class SecurityFinding:
     ai_recommendation: str | None = None
     code_snippet: str | None = None
     code_snippet_start_line: int | None = None
+    cwe: str | None = None              # canonical "CWE-###" (catalog or scanner-reported)
+    policy_item: str | None = None      # matched 16-item catalog key, None if outside the catalog
+    in_scope: bool = True               # False if not among the user-selected items
+    column_number: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

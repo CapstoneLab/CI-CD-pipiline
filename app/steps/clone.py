@@ -7,7 +7,14 @@ from app.models import StepRunResult
 from app.utils.shell import run_command
 
 
-def run_clone(repo_url: str, branch: str | None, repo_dir: Path, log_file: Path) -> StepRunResult:
+def run_clone(
+    repo_url: str,
+    branch: str | None,
+    repo_dir: Path,
+    log_file: Path,
+    commit_sha: str | None = None,
+    repo_token: str | None = None,
+) -> StepRunResult:
     if repo_dir.exists():
         shutil.rmtree(repo_dir)
 
@@ -21,6 +28,7 @@ def run_clone(repo_url: str, branch: str | None, repo_dir: Path, log_file: Path)
             branch=candidate_branch,
             repo_dir=repo_dir,
             log_file=log_file,
+            repo_token=repo_token,
         )
         result = current_result
 
@@ -34,26 +42,100 @@ def run_clone(repo_url: str, branch: str | None, repo_dir: Path, log_file: Path)
 
     assert result is not None
 
-    if result.exit_code == 0:
+    if result.exit_code != 0:
         return StepRunResult(
-            status="success",
-            exit_code=0,
-            summary_message=f"Repository cloned and branch {used_branch} checked out",
+            status="failed",
+            exit_code=result.exit_code,
+            summary_message="git clone failed. Check clone.log for details",
+        )
+
+    commit_note = ""
+    if commit_sha:
+        checked_out = _checkout_commit(commit_sha, repo_dir, log_file, repo_token)
+        commit_note = (
+            f", commit {commit_sha[:12]} checked out"
+            if checked_out
+            else f", commit {commit_sha[:12]} unavailable — fell back to {used_branch} HEAD"
         )
 
     return StepRunResult(
-        status="failed",
-        exit_code=result.exit_code,
-        summary_message="git clone failed. Check clone.log for details",
+        status="success",
+        exit_code=0,
+        summary_message=f"Repository cloned and branch {used_branch} checked out{commit_note}",
     )
 
 
-def _run_clone_command(repo_url: str, branch: str | None, repo_dir: Path, log_file: Path):
+def _checkout_commit(
+    commit_sha: str, repo_dir: Path, log_file: Path, repo_token: str | None = None
+) -> bool:
+    """Fetch + checkout an exact commit on top of a shallow clone.
+
+    Returns True if the commit was checked out, False if it could not be
+    fetched (e.g. removed by force-push/rebase) — caller stays on branch HEAD.
+    """
+    fetch = run_command(
+        command=["git", "fetch", "--depth", "1", "origin", commit_sha],
+        cwd=repo_dir,
+        log_file=log_file,
+        env=_clone_env(repo_token),
+    )
+    if fetch.exit_code != 0:
+        return False
+    checkout = run_command(
+        command=["git", "checkout", commit_sha],
+        cwd=repo_dir,
+        log_file=log_file,
+    )
+    return checkout.exit_code == 0
+
+
+def _run_clone_command(
+    repo_url: str,
+    branch: str | None,
+    repo_dir: Path,
+    log_file: Path,
+    repo_token: str | None = None,
+):
+    clone_url = _inject_token(repo_url, repo_token)
     cmd = ["git", "clone", "--depth", "1"]
     if branch:
         cmd.extend(["--branch", branch])
-    cmd.extend([repo_url, str(repo_dir)])
-    return run_command(command=cmd, cwd=repo_dir.parent, log_file=log_file)
+    cmd.extend([clone_url, str(repo_dir)])
+    return run_command(
+        command=cmd,
+        cwd=repo_dir.parent,
+        log_file=log_file,
+        env=_clone_env(repo_token),
+    )
+
+
+def _clone_env(repo_token: str | None) -> dict[str, str]:
+    # GIT_TERMINAL_PROMPT=0: fail fast instead of hanging on a credential prompt
+    # when a repo is private/missing and no usable token was supplied.
+    # GIT_TOKEN: not read by git, but its presence makes run_command treat the
+    # value as sensitive and mask it (incl. the token embedded in the clone URL).
+    env = {"GIT_TERMINAL_PROMPT": "0"}
+    if repo_token:
+        env["GIT_TOKEN"] = repo_token
+    return env
+
+
+def _inject_token(repo_url: str, repo_token: str | None) -> str:
+    """Embed an OAuth/PAT token into an https git URL for private-repo access.
+
+    Returns the URL unchanged for non-https URLs, when no token is given, or
+    when credentials are already present in the authority component.
+    """
+    if not repo_token:
+        return repo_url
+    prefix = "https://"
+    if not repo_url.startswith(prefix):
+        return repo_url
+    rest = repo_url[len(prefix):]
+    authority = rest.split("/", 1)[0]
+    if "@" in authority:
+        return repo_url
+    return f"{prefix}x-access-token:{repo_token}@{rest}"
 
 
 def _is_missing_branch_error(output: str) -> bool:

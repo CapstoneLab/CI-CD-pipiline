@@ -36,6 +36,17 @@ _IGNORED_DIRS = {
 ENGINE_MANAGED_JAVA_ARTIFACTS = {"semgrep", "gitleaks"}
 
 
+def _maven_local_repo_arg(repo_dir: Path) -> str:
+    """Keep Maven's dependency cache inside the workspace.
+
+    Some CI hosts have a shared ``~/.m2`` owned by another user/root. Maven
+    then fails before the project is even evaluated with AccessDeniedException.
+    A project-local repository is slower on a cold run but deterministic and
+    writable for frontend-triggered jobs.
+    """
+    return f"-Dmaven.repo.local={repo_dir / '.localci' / 'm2-repository'}"
+
+
 def _has_java_marker(directory: Path) -> bool:
     return any((directory / marker).exists() for marker in _PROJECT_MARKERS)
 
@@ -184,6 +195,7 @@ def install_command(repo_dir: Path, build_tool: str) -> list[str]:
             exe,
             "-B",  # batch mode (non-interactive)
             "-ntp",  # no transfer progress (cleaner logs)
+            _maven_local_repo_arg(repo_dir),
             "-DskipTests",
             "dependency:go-offline",
         ]
@@ -205,8 +217,8 @@ def install_command_fallbacks(repo_dir: Path, build_tool: str) -> list[list[str]
 
     if build_tool == "maven":
         return [
-            [exe, "-B", "-ntp", "-DskipTests", "compile"],
-            [exe, "-B", "-ntp", "-DskipTests", "validate"],
+            [exe, "-B", "-ntp", _maven_local_repo_arg(repo_dir), "-DskipTests", "compile"],
+            [exe, "-B", "-ntp", _maven_local_repo_arg(repo_dir), "-DskipTests", "validate"],
         ]
 
     if build_tool == "gradle":
@@ -223,7 +235,7 @@ def test_command(repo_dir: Path, build_tool: str) -> list[str]:
     exe = build_tool_executable(repo_dir, build_tool)
 
     if build_tool == "maven":
-        return [exe, "-B", "-ntp", "test"]
+        return [exe, "-B", "-ntp", _maven_local_repo_arg(repo_dir), "test"]
 
     if build_tool == "gradle":
         return [exe, "--no-daemon", "test"]
@@ -235,7 +247,7 @@ def build_command(repo_dir: Path, build_tool: str) -> list[str]:
     exe = build_tool_executable(repo_dir, build_tool)
 
     if build_tool == "maven":
-        return [exe, "-B", "-ntp", "-DskipTests", "package"]
+        return [exe, "-B", "-ntp", _maven_local_repo_arg(repo_dir), "-DskipTests", "package"]
 
     if build_tool == "gradle":
         if is_spring_boot_project(repo_dir):
@@ -251,7 +263,15 @@ def build_command_fallbacks(repo_dir: Path, build_tool: str) -> list[list[str]]:
 
     if build_tool == "maven":
         return [
-            [exe, "-B", "-ntp", "-DskipTests", "-Dmaven.test.skip=true", "package"],
+            [
+                exe,
+                "-B",
+                "-ntp",
+                _maven_local_repo_arg(repo_dir),
+                "-DskipTests",
+                "-Dmaven.test.skip=true",
+                "package",
+            ],
         ]
 
     if build_tool == "gradle":

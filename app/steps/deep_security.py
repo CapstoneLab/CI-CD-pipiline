@@ -29,14 +29,19 @@ def run_deep_security_scan(
             ),
         )
 
+    semgrep_home = Path("/tmp") / "cicd-engine-semgrep-home"
+    semgrep_home.mkdir(parents=True, exist_ok=True)
+
     cmd = [semgrep_executable, "--config", "auto", "--json", "--output", str(report_file), "."]
     result = run_command(
         command=cmd,
         cwd=repo_dir,
         log_file=log_file,
         env={
+            "HOME": str(semgrep_home),
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
+            "XDG_CONFIG_HOME": str(semgrep_home / ".config"),
         },
     )
 
@@ -61,6 +66,13 @@ def run_deep_security_scan(
             status="failed",
             exit_code=result.exit_code,
             summary_message="semgrep execution failed",
+        )
+
+    if "Traceback (most recent call last)" in result.output or not report_file.exists():
+        return StepRunResult(
+            status="failed",
+            exit_code=result.exit_code or 1,
+            summary_message="semgrep execution failed before producing a valid report",
         )
 
     summary, findings = parse_semgrep_report(report_file)
