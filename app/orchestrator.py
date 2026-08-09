@@ -21,7 +21,7 @@ from app.steps.deploy import run_deploy
 from app.steps.install import run_install
 from app.steps.lightweight_security import run_lightweight_security_scan
 from app.steps.test import run_test
-from app.utils.filesystem import make_run_id, prepare_run_paths, save_json
+from app.utils.filesystem import data_root, make_run_id, prepare_run_paths, save_json
 from app.utils.logger import append_log
 from app.utils.shell import run_command
 from app.workflow import WorkflowStepDefinition, resolve_workflow_definition
@@ -77,6 +77,17 @@ class LocalOrchestrator:
         self._repo_token = (repo_token or "").strip() or None
         self._security_verdict: SecurityVerdict | None = None
 
+    def _store_log_file(self, log_file: Path) -> str:
+        """Return a portable log reference relative to the persistent data root."""
+        return str(log_file.relative_to(data_root(self.base_dir)))
+
+    def _resolve_log_file(self, log_file: str) -> Path:
+        """Resolve current data-root references while accepting legacy absolute paths."""
+        path = Path(log_file)
+        if path.is_absolute():
+            return path
+        return data_root(self.base_dir) / path
+
     def run(self, repo_url: str, branch: str | None, workflow_path: str | None = None) -> tuple[PipelineRun, Path]:
         run_id = make_run_id(self.base_dir)
         paths = prepare_run_paths(base_dir=self.base_dir, run_id=run_id)
@@ -126,7 +137,7 @@ class LocalOrchestrator:
         if env_check_result is not None:
             env_step = PipelineStep(step_name="env_check")
             pipeline_run.steps.append(env_step)
-            env_step.log_file = str((logs_dir / "env_check.log").relative_to(self.base_dir))
+            env_step.log_file = self._store_log_file(logs_dir / "env_check.log")
             env_step.started_at = now_iso()
             self._record_step_result(
                 pipeline_run=pipeline_run,
@@ -274,7 +285,7 @@ class LocalOrchestrator:
         pipeline_run.current_step = step.step_name
         step.status = "running"
         step.started_at = now_iso()
-        step.log_file = str((logs_dir / f"{step.step_name}.log").relative_to(self.base_dir))
+        step.log_file = self._store_log_file(logs_dir / f"{step.step_name}.log")
         self._write_pipeline_result(run_dir, pipeline_run)
 
         try:
@@ -319,7 +330,7 @@ class LocalOrchestrator:
         step.summary_message = result.summary_message
 
         if step.log_file:
-            step_log_path = self.base_dir / step.log_file
+            step_log_path = self._resolve_log_file(step.log_file)
             append_log(step_log_path, f"[step_status] {step.status}")
             append_log(step_log_path, f"[step_summary] {step.summary_message or 'no message'}")
             append_log(step_log_path, f"[step_exit_code] {step.exit_code if step.exit_code is not None else 'null'}")
@@ -341,7 +352,7 @@ class LocalOrchestrator:
 
         step_log: list[str] = []
         if step.log_file:
-            log_path = self.base_dir / step.log_file
+            log_path = self._resolve_log_file(step.log_file)
             if log_path.exists():
                 try:
                     step_log = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -683,9 +694,9 @@ class LocalOrchestrator:
 
         gate_step = PipelineStep(step_name="security_gate")
         pipeline_run.steps.append(gate_step)
-        gate_step.log_file = str((logs_dir / "security_gate.log").relative_to(self.base_dir))
+        gate_step.log_file = self._store_log_file(logs_dir / "security_gate.log")
         gate_step.started_at = now_iso()
-        log_path = self.base_dir / gate_step.log_file
+        log_path = self._resolve_log_file(gate_step.log_file)
         append_log(log_path, f"$ security_gate (environment={verdict.environment})")
         if verdict.scanned_commit_sha:
             append_log(log_path, f"[commit] scanned {verdict.scanned_commit_sha}")
