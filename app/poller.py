@@ -53,10 +53,13 @@ def _http_json(
     *,
     token: str,
     engine_id: str,
+    payload: dict[str, Any] | None = None,
     timeout_sec: int = 10,
 ) -> tuple[int, dict | list | None, str]:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = request.Request(
         url,
+        data=body,
         method=method,
         headers={
             "x-engine-token": token,
@@ -105,6 +108,27 @@ def _claim(base_url: str, job_id: str, token: str, engine_id: str) -> bool:
         return False
     logger.warning("claim failed for %s: HTTP %s  %s", job_id, status, raw[:200])
     return False
+
+
+def _report_failure(
+    base_url: str,
+    job_id: str,
+    token: str,
+    engine_id: str,
+    *,
+    reason: str,
+    detail: str = "",
+) -> None:
+    url = f"{base_url.rstrip('/')}/api/jobs/{job_id}/fail"
+    status, _payload, raw = _http_json(
+        "POST",
+        url,
+        token=token,
+        engine_id=engine_id,
+        payload={"reason": reason, "detail": detail},
+    )
+    if status != 200:
+        logger.warning("failure report failed for %s: HTTP %s  %s", job_id, status, raw[:200])
 
 
 def _normalize_selected_items(value: Any) -> list[str]:
@@ -203,7 +227,7 @@ def _spawn_pipeline(
     return proc
 
 
-def _reaper(running: dict[str, subprocess.Popen]) -> None:
+def _reaper(running: dict[str, subprocess.Popen], base_url: str, token: str, engine_id: str) -> None:
     finished: list[str] = []
     for job_id, proc in running.items():
         rc = proc.poll()
@@ -211,6 +235,15 @@ def _reaper(running: dict[str, subprocess.Popen]) -> None:
             continue
         finished.append(job_id)
         logger.info("pipeline finished job=%s pid=%s exit=%s", job_id, proc.pid, rc)
+        if rc != 0:
+            _report_failure(
+                base_url,
+                job_id,
+                token,
+                engine_id,
+                reason="engine_process_failed",
+                detail=f"engine process exited with code {rc}",
+            )
     for job_id in finished:
         running.pop(job_id, None)
 
@@ -254,7 +287,7 @@ def main() -> int:
 
     while not stop.is_set():
         try:
-            _reaper(running)
+            _reaper(running, base_url, token, engine_id)
             jobs = _fetch_pending(base_url, token, engine_id, fetch_limit)
             for job in jobs:
                 job_id = str(job.get("job_id"))
@@ -265,6 +298,15 @@ def main() -> int:
                 proc = _spawn_pipeline(job, callback_url, token)
                 if proc is not None:
                     running[job_id] = proc
+                else:
+                    _report_failure(
+                        base_url,
+                        job_id,
+                        token,
+                        engine_id,
+                        reason="engine_start_failed",
+                        detail="poller could not spawn local pipeline process",
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.exception("poller loop error: %s", exc)
 
@@ -273,7 +315,7 @@ def main() -> int:
     logger.info("waiting for %s running pipelines to finish...", len(running))
     deadline = time.time() + 60
     while running and time.time() < deadline:
-        _reaper(running)
+        _reaper(running, base_url, token, engine_id)
         if running:
             time.sleep(2)
 

@@ -11,6 +11,36 @@ def test_docker_only_mode_skips_host_poller(monkeypatch, tmp_path: Path) -> None
     assert poller.main() == 0
 
 
+def test_report_failure_posts_engine_failure_payload(monkeypatch) -> None:
+    calls = []
+
+    def fake_http_json(method, url, *, token, engine_id, payload=None, timeout_sec=10):
+        calls.append((method, url, token, engine_id, payload, timeout_sec))
+        return 200, {"status": "failed"}, ""
+
+    monkeypatch.setattr(poller, "_http_json", fake_http_json)
+
+    poller._report_failure(
+        "http://backend:8000",
+        "job-1",
+        "shared",
+        "engine-1",
+        reason="engine_start_failed",
+        detail="spawn failed",
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "http://backend:8000/api/jobs/job-1/fail",
+            "shared",
+            "engine-1",
+            {"reason": "engine_start_failed", "detail": "spawn failed"},
+            10,
+        )
+    ]
+
+
 def test_normalize_selected_items_accepts_backend_payload_shapes() -> None:
     assert poller._normalize_selected_items("CWE-89, sql-injection") == [
         "CWE-89",
