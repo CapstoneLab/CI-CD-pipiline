@@ -23,6 +23,7 @@ except ImportError:
     pass
 
 LOG_PATH = data_root(BASE_DIR) / "runs" / "poller.log"
+CONTAINER_MARKER = Path("/.dockerenv")
 
 logger = logging.getLogger("poller")
 
@@ -126,7 +127,11 @@ def _normalize_selected_items(value: Any) -> list[str]:
     return []
 
 
-def _spawn_pipeline(job: dict[str, Any], callback_url: str) -> subprocess.Popen | None:
+def _spawn_pipeline(
+    job: dict[str, Any],
+    callback_url: str,
+    callback_token: str = "",
+) -> subprocess.Popen | None:
     job_id = str(job.get("job_id") or "").strip()
     repo_url = str(job.get("repo_url") or "").strip()
     branch = str(job.get("branch") or "main").strip() or "main"
@@ -163,6 +168,8 @@ def _spawn_pipeline(job: dict[str, Any], callback_url: str) -> subprocess.Popen 
         "--environment", environment,
         "--callback-url", callback_url,
     ]
+    if callback_token:
+        cmd.extend(["--callback-token", callback_token])
     if workflow_path:
         cmd.extend(["--workflow", workflow_path])
     if selected_items:
@@ -181,7 +188,8 @@ def _spawn_pipeline(job: dict[str, Any], callback_url: str) -> subprocess.Popen 
     spawn_log.parent.mkdir(parents=True, exist_ok=True)
     log_fh = spawn_log.open("ab", buffering=0)
     log_fh.write(f"\n=== poller spawn at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-    safe_cmd = " ".join("****" if repo_token and tok == repo_token else tok for tok in cmd)
+    sensitive_args = {value for value in (repo_token, callback_token) if value}
+    safe_cmd = " ".join("****" if tok in sensitive_args else tok for tok in cmd)
     log_fh.write(f"cmd: {safe_cmd}\n\n".encode())
 
     proc = subprocess.Popen(
@@ -209,6 +217,11 @@ def _reaper(running: dict[str, subprocess.Popen]) -> None:
 
 def main() -> int:
     _setup_logging()
+
+    docker_only = os.environ.get("ENGINE_DOCKER_ONLY", "").strip().lower()
+    if docker_only in {"1", "true", "yes", "on"} and not CONTAINER_MARKER.exists():
+        logger.info("ENGINE_DOCKER_ONLY is enabled; host poller exits without claiming jobs")
+        return 0
 
     base_url = _require_env("BACKEND_BASE_URL")
     token = _require_env("ENGINE_SHARED_TOKEN")
@@ -249,7 +262,7 @@ def main() -> int:
                     continue
                 if not _claim(base_url, job_id, token, engine_id):
                     continue
-                proc = _spawn_pipeline(job, callback_url)
+                proc = _spawn_pipeline(job, callback_url, token)
                 if proc is not None:
                     running[job_id] = proc
         except Exception as exc:  # noqa: BLE001

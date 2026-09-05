@@ -36,6 +36,7 @@ from app.callback import (
     save_callback_delivery_result,
     save_callback_payload,
 )
+from app.log_stream import CallbackLogStreamer
 from app.orchestrator import LocalOrchestrator
 
 
@@ -130,17 +131,26 @@ def main() -> int:
         approved_cwes=_parse_selected_items(args.approved_cwes),
         repo_token=args.repo_token.strip() or None,
     )
-    pipeline_run, run_dir = orchestrator.run(
+    with CallbackLogStreamer(
+        callback_url=callback_url,
+        callback_token=callback_token,
+        job_id=job_id,
         repo_url=args.repo,
         branch=branch,
-        workflow_path=args.workflow or None,
-    )
+    ):
+        pipeline_run, run_dir = orchestrator.run(
+            repo_url=args.repo,
+            branch=branch,
+            workflow_path=args.workflow or None,
+        )
 
     security_summaries_data = _load_json_list(run_dir / "security_summary.json")
     security_findings_data = _load_json_list(run_dir / "security_findings.json")
     security_verdict_data = _load_json_object(run_dir / "security_verdict.json")
 
-    deploy_endpoint = _load_json_object(run_dir / "deploy_endpoint.json")
+    deploy_endpoint = _load_json_object(run_dir / "deployment_result.json")
+    if deploy_endpoint is None:
+        deploy_endpoint = _load_json_object(run_dir / "deploy_endpoint.json")
 
     if callback_url:
         final_job_id = job_id or pipeline_run.run_id
@@ -158,6 +168,7 @@ def main() -> int:
             security_summaries=security_summaries_data,
             security_findings=security_findings_data,
             security_verdict=security_verdict_data,
+            deployment=deploy_endpoint,
         )
         payload["type"] = "pipeline_complete"
         if deploy_endpoint:

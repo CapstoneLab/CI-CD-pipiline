@@ -25,7 +25,7 @@ python main.py --repo https://github.com/example/repo.git --branch main
 
 Run with Windows callback delivery:
 
-python main.py --job-id <uuid> --repo https://github.com/example/repo.git --branch main --callback-url https://windows-host/get-results --callback-token <shared-token>
+python main.py --job-id <uuid> --repo https://github.com/example/repo.git --branch main --callback-url http://192.168.0.4:8000/get-results --callback-token <shared-token>
 
 Run with repository default branch:
 
@@ -117,6 +117,8 @@ Each run generates:
 - runs/run-YYYYMMDD-XXX/security_findings.json
 - runs/run-YYYYMMDD-XXX/callback_result.json (when callback_url is set)
 - runs/run-YYYYMMDD-XXX/callback_delivery.json (callback transmission status)
+- runs/run-YYYYMMDD-XXX/deployment_result.json (successful deploy URL contract)
+- runs/run-YYYYMMDD-XXX/log_stream_failures.jsonl (only when live callback delivery fails)
 - runs/run-YYYYMMDD-XXX/logs/*.log
 - runs/run-YYYYMMDD-XXX/artifacts/** (build outputs)
 
@@ -137,3 +139,15 @@ Cloned repository workspace:
 ## Note about juice-shop
 
 https://github.com/juice-shop/juice-shop is a Node repository and is now supported by this MVP.
+
+## Public deployment URLs
+
+The user-facing deployment base is `https://112.186.136.153/services`; it is
+not the engine/backend API. Each successful deployment is available at
+`https://112.186.136.153/services/{githubOwner}/{repository}`. See
+`PUBLIC_INGRESS_RUNBOOK.md` for NAT, firewall, HTTPS, reboot, and verification
+operations.
+
+The engine streams new log lines to the configured callback as `log_batch`
+events. The backend/frontend WebSocket flow and the deployment URL REST
+contract are documented in `REALTIME_LOG_DEPLOYMENT_API.md`.

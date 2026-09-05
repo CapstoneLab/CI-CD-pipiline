@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -377,6 +378,7 @@ class LocalOrchestrator:
             step_log=step_log,
             step_security_summary=step_security_summary,
             step_security_findings=step_security_findings,
+            deployment=self._load_deployment_result(run_dir) if step.step_name == "deploy" else None,
         )
 
         ok, detail = post_step_callback(
@@ -388,6 +390,20 @@ class LocalOrchestrator:
             print(f"  -> step callback sent: {step.step_name}")
         else:
             print(f"  -> step callback failed: {step.step_name} ({detail})")
+
+    @staticmethod
+    def _load_deployment_result(run_dir: Path) -> dict[str, Any] | None:
+        for name in ("deployment_result.json", "deploy_endpoint.json"):
+            path = run_dir / name
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                return data
+        return None
 
     @staticmethod
     def _mark_remaining_steps_skipped(

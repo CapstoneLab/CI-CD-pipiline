@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -58,11 +59,16 @@ def _duration_secs(started_at: str | None, finished_at: str | None) -> float | N
     return round((end - start).total_seconds(), 1)
 
 
-def _serialize_step(step: Any) -> dict[str, Any]:
+def _serialize_step(
+    step: Any,
+    *,
+    step_order: int | None = None,
+    total_steps: int | None = None,
+) -> dict[str, Any]:
     """Backend-facing step shape. Keeps legacy fields and adds the backend's
     documented fields (step_name, step_type, duration_secs, error_message, metadata)."""
     error_message = step.summary_message if step.status == "failed" else None
-    return {
+    serialized = {
         "name": step.step_name,
         "step_name": step.step_name,
         "step_type": _step_type(step.step_name),
@@ -76,6 +82,11 @@ def _serialize_step(step: Any) -> dict[str, Any]:
         "log_file": step.log_file,
         "metadata": {},
     }
+    if step_order is not None:
+        serialized["step_order"] = step_order
+    if total_steps is not None:
+        serialized["total_steps"] = total_steps
+    return serialized
 
 
 def _truncate_text(value: Any, max_chars: int) -> Any:
@@ -135,6 +146,7 @@ def build_callback_payload(
     security_summaries: list[dict[str, Any]] | None = None,
     security_findings: list[dict[str, Any]] | None = None,
     security_verdict: dict[str, Any] | None = None,
+    deployment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     compact_findings, compact_metadata = compact_security_findings(security_findings)
     log_metadata = {
@@ -149,12 +161,16 @@ def build_callback_payload(
         "started_at": pipeline_run.started_at,
         "ended_at": pipeline_run.finished_at,
         "logs": logs,
-        "steps": [_serialize_step(step) for step in pipeline_run.steps],
+        "steps": [
+            _serialize_step(step, step_order=index, total_steps=len(pipeline_run.steps))
+            for index, step in enumerate(pipeline_run.steps, start=1)
+        ],
         "security": {
             "summaries": security_summaries or [],
             "findings": compact_findings,
             "verdict": security_verdict,
         },
+        "deployment": deployment,
         "metadata": {
             "executor": "ubuntu-ci-engine",
             "run_id": pipeline_run.run_id,
@@ -234,7 +250,7 @@ def post_callback_with_retry(
     retry_delays_sec: list[int] | None = None,
     timeout_sec: int = 10,
 ) -> tuple[bool, dict[str, Any]]:
-    delays = retry_delays_sec or [5, 15, 30]
+    delays = [5, 15, 30] if retry_delays_sec is None else retry_delays_sec
     attempts = 1 + len(delays)
 
     last_error = ""
@@ -311,7 +327,28 @@ def build_step_callback_payload(
     step_log: list[str],
     step_security_summary: dict[str, Any] | None = None,
     step_security_findings: list[dict[str, Any]] | None = None,
+    deployment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    total_steps = len(pipeline_run.steps)
+    step_order = next(
+        (
+            index
+            for index, candidate in enumerate(pipeline_run.steps, start=1)
+            if candidate is step
+        ),
+        None,
+    )
+    if step_order is None:
+        step_order = next(
+            (
+                index
+                for index, candidate in enumerate(pipeline_run.steps, start=1)
+                if candidate.step_name == step.step_name
+            ),
+            None,
+        )
+    delivery_key = f"{job_id}:{step.step_name}:{step.finished_at or step.started_at or ''}"
+    delivery_id = sha256(delivery_key.encode("utf-8")).hexdigest()
     return {
         "job_id": job_id,
         "type": "step_complete",
@@ -319,13 +356,15 @@ def build_step_callback_payload(
         "repo_url": repo_url,
         "branch": branch,
         "step": {
-            **_serialize_step(step),
+            **_serialize_step(step, step_order=step_order, total_steps=total_steps),
+            "delivery_id": delivery_id,
             "logs": step_log,
             "security": {
                 "summary": step_security_summary,
                 "findings": step_security_findings or [],
             },
         },
+        "deployment": deployment,
         "metadata": {
             "executor": "ubuntu-ci-engine",
             "run_id": pipeline_run.run_id,
@@ -341,13 +380,18 @@ def post_step_callback(
     callback_token: str,
     payload: dict[str, Any],
     timeout_sec: int = 10,
+    retry_delays_sec: list[int] | None = None,
 ) -> tuple[bool, str]:
-    return _post_once(
+    ok, result = post_callback_with_retry(
         callback_url=callback_url,
         callback_token=callback_token,
         payload=payload,
         timeout_sec=timeout_sec,
+        retry_delays_sec=retry_delays_sec or [1, 3, 10],
     )
+    if ok:
+        return True, f"http {result['http_status']} after {result['attempts']} attempt(s)"
+    return False, f"{result['error']} after {result['attempts']} attempt(s)"
 
 
 def _normalize_status(status: str) -> str:
